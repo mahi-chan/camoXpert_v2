@@ -55,14 +55,18 @@ class AdvancedCODLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
+        # Cast sobel filters to match input dtype (handles FP16/FP32)
+        sobel_x = self.sobel_x.to(pred.dtype)
+        sobel_y = self.sobel_y.to(pred.dtype)
+
         # Use cached sobel filters (no tensor creation overhead!)
-        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1)
-        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1)
+        pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred, sobel_y, padding=1)
         # Ensure non-negative before sqrt
         pred_edge = torch.sqrt(torch.clamp(pred_edge_x ** 2 + pred_edge_y ** 2, min=0) + 1e-5)
 
-        target_edge_x = F.conv2d(target, self.sobel_x, padding=1)
-        target_edge_y = F.conv2d(target, self.sobel_y, padding=1)
+        target_edge_x = F.conv2d(target, sobel_x, padding=1)
+        target_edge_y = F.conv2d(target, sobel_y, padding=1)
         target_edge = torch.sqrt(target_edge_x ** 2 + target_edge_y ** 2 + 1e-5)
 
         return F.mse_loss(pred_edge, target_edge)
@@ -176,13 +180,17 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)
 
+        # Cast sobel filters to match input dtype (handles FP16/FP32)
+        sobel_x = self.sobel_x.to(pred.dtype)
+        sobel_y = self.sobel_y.to(pred.dtype)
+
         # Use cached sobel filters (no tensor creation overhead!)
-        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1)
-        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1)
+        pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred, sobel_y, padding=1)
         pred_edge = torch.sqrt(torch.clamp(pred_edge_x ** 2 + pred_edge_y ** 2, min=0) + 1e-5)
 
-        target_edge_x = F.conv2d(target, self.sobel_x, padding=1)
-        target_edge_y = F.conv2d(target, self.sobel_y, padding=1)
+        target_edge_x = F.conv2d(target, sobel_x, padding=1)
+        target_edge_y = F.conv2d(target, sobel_y, padding=1)
         target_edge = torch.sqrt(target_edge_x ** 2 + target_edge_y ** 2 + 1e-5)
 
         return F.mse_loss(pred_edge, target_edge)
@@ -195,9 +203,12 @@ class CODSpecializedLoss(nn.Module):
         """
         pred = torch.clamp(pred, min=-15, max=15)
 
+        # Cast boundary kernel to match input dtype (handles FP16/FP32)
+        boundary_kernel = self.boundary_kernel.to(target.dtype)
+
         # Extract boundaries using morphological operations (use cached kernel!)
-        dilated = F.conv2d(target, self.boundary_kernel, padding=1)
-        eroded = 1 - F.conv2d(1 - target, self.boundary_kernel, padding=1)
+        dilated = F.conv2d(target, boundary_kernel, padding=1)
+        eroded = 1 - F.conv2d(1 - target, boundary_kernel, padding=1)
         boundary = dilated - eroded
 
         # Higher weight on boundaries (5x)

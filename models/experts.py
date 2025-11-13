@@ -160,17 +160,14 @@ class EdgeExpert(nn.Module):
 
         Uses grouped convolutions to apply Sobel/Laplacian to all channels in parallel.
         ~30% faster than the original channel-wise loop implementation.
-
-        FIX: Added .contiguous() to prevent CUDA misaligned address errors
         """
         B, C, H, W = x.shape
 
         # Create kernels for grouped convolution: [C, 1, 3, 3]
         # Each output channel uses its own kernel (groups=C)
-        # CRITICAL: .contiguous() ensures proper memory layout for CUDA grouped conv
-        sobel_x = self.sobel_x_base.repeat(C, 1, 1, 1).contiguous()  # [C, 1, 3, 3]
-        sobel_y = self.sobel_y_base.repeat(C, 1, 1, 1).contiguous()  # [C, 1, 3, 3]
-        laplacian = self.laplacian_base.repeat(C, 1, 1, 1).contiguous()  # [C, 1, 3, 3]
+        sobel_x = self.sobel_x_base.repeat(C, 1, 1, 1)  # [C, 1, 3, 3]
+        sobel_y = self.sobel_y_base.repeat(C, 1, 1, 1)  # [C, 1, 3, 3]
+        laplacian = self.laplacian_base.repeat(C, 1, 1, 1)  # [C, 1, 3, 3]
 
         # Apply grouped convolutions (each channel processed independently but in parallel)
         sx = F.conv2d(x, sobel_x, padding=1, groups=C)  # [B, C, H, W]
