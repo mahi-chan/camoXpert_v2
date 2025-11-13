@@ -14,6 +14,8 @@ class AdvancedCODLoss(nn.Module):
     - IoU Loss
     - Edge-aware Loss
     - Auxiliary MoE Loss
+
+    PERFORMANCE OPTIMIZED: Cache sobel filters to avoid recreating on every forward pass
     """
 
     def __init__(self, bce_weight=1.0, iou_weight=1.0, edge_weight=0.5, aux_weight=0.1):
@@ -26,6 +28,13 @@ class AdvancedCODLoss(nn.Module):
         self.iou_weight = iou_weight
         self.edge_weight = edge_weight
         self.aux_weight = aux_weight
+
+        # PERFORMANCE FIX: Register sobel kernels as buffers
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
 
     def iou_loss(self, pred, target):
         """IoU loss"""
@@ -41,25 +50,19 @@ class AdvancedCODLoss(nn.Module):
         return 1 - iou.mean()
 
     def edge_loss(self, pred, target):
-        """Edge-aware loss"""
+        """Edge-aware loss - OPTIMIZED: uses cached sobel filters"""
         # Clamp logits to prevent NaN in mixed precision
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
-        # Sobel filters for edge detection
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                               dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                               dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-
-        # Compute edges
-        pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
-        pred_edge_y = F.conv2d(pred, sobel_y, padding=1)
+        # Use cached sobel filters (no tensor creation overhead!)
+        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1)
         # Ensure non-negative before sqrt
         pred_edge = torch.sqrt(torch.clamp(pred_edge_x ** 2 + pred_edge_y ** 2, min=0) + 1e-5)
 
-        target_edge_x = F.conv2d(target, sobel_x, padding=1)
-        target_edge_y = F.conv2d(target, sobel_y, padding=1)
+        target_edge_x = F.conv2d(target, self.sobel_x, padding=1)
+        target_edge_y = F.conv2d(target, self.sobel_y, padding=1)
         target_edge = torch.sqrt(target_edge_x ** 2 + target_edge_y ** 2 + 1e-5)
 
         return F.mse_loss(pred_edge, target_edge)
@@ -129,6 +132,8 @@ class CODSpecializedLoss(nn.Module):
     """
     100% COD-Specialized Loss Function
     Includes boundary-aware, uncertainty-aware, and reverse attention losses
+
+    PERFORMANCE OPTIMIZED: Cache sobel/boundary filters to avoid recreating on every forward pass
     """
 
     def __init__(self, bce_weight=5.0, iou_weight=3.0, edge_weight=2.0, boundary_weight=3.0,
@@ -144,6 +149,16 @@ class CODSpecializedLoss(nn.Module):
         self.reverse_attention_weight = reverse_attention_weight
         self.aux_weight = aux_weight
 
+        # PERFORMANCE FIX: Register sobel and boundary kernels as buffers
+        # This avoids recreating tensors on every forward pass
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        boundary_kernel = torch.ones(1, 1, 3, 3, dtype=torch.float32) / 9
+
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+        self.register_buffer('boundary_kernel', boundary_kernel)
+
     def iou_loss(self, pred, target):
         """IoU loss"""
         pred = torch.clamp(pred, min=-15, max=15)
@@ -157,21 +172,17 @@ class CODSpecializedLoss(nn.Module):
         return 1 - iou.mean()
 
     def edge_loss(self, pred, target):
-        """Edge-aware loss"""
+        """Edge-aware loss - OPTIMIZED: uses cached sobel filters"""
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)
 
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-                               dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
-                               dtype=pred.dtype, device=pred.device).view(1, 1, 3, 3)
-
-        pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
-        pred_edge_y = F.conv2d(pred, sobel_y, padding=1)
+        # Use cached sobel filters (no tensor creation overhead!)
+        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1)
         pred_edge = torch.sqrt(torch.clamp(pred_edge_x ** 2 + pred_edge_y ** 2, min=0) + 1e-5)
 
-        target_edge_x = F.conv2d(target, sobel_x, padding=1)
-        target_edge_y = F.conv2d(target, sobel_y, padding=1)
+        target_edge_x = F.conv2d(target, self.sobel_x, padding=1)
+        target_edge_y = F.conv2d(target, self.sobel_y, padding=1)
         target_edge = torch.sqrt(target_edge_x ** 2 + target_edge_y ** 2 + 1e-5)
 
         return F.mse_loss(pred_edge, target_edge)
@@ -180,13 +191,13 @@ class CODSpecializedLoss(nn.Module):
         """
         Boundary-aware loss: Focus heavily on boundary regions
         Boundaries are the hardest part in COD
+        OPTIMIZED: uses cached boundary kernel
         """
         pred = torch.clamp(pred, min=-15, max=15)
 
-        # Extract boundaries using morphological operations
-        kernel = torch.ones(1, 1, 3, 3, device=target.device) / 9
-        dilated = F.conv2d(target, kernel, padding=1)
-        eroded = 1 - F.conv2d(1 - target, kernel, padding=1)
+        # Extract boundaries using morphological operations (use cached kernel!)
+        dilated = F.conv2d(target, self.boundary_kernel, padding=1)
+        eroded = 1 - F.conv2d(1 - target, self.boundary_kernel, padding=1)
         boundary = dilated - eroded
 
         # Higher weight on boundaries (5x)
