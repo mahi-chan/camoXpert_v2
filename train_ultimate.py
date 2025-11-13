@@ -120,20 +120,43 @@ class EMA:
 
 
 def setup_ddp(args):
-    """Initialize DistributedDataParallel"""
+    """
+    Initialize DistributedDataParallel
+
+    NOTE: For multi-GPU training with DDP, you must launch with torchrun:
+        torchrun --nproc_per_node=2 train_ultimate.py train --use-ddp ...
+    """
+    # Set default MASTER_ADDR and MASTER_PORT for single-node training if not set
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = '12355'
+
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # Launched with torchrun or torch.distributed.launch
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
         args.local_rank = int(os.environ["LOCAL_RANK"])
     elif 'SLURM_PROCID' in os.environ:
+        # Running on SLURM cluster
         args.rank = int(os.environ['SLURM_PROCID'])
+        args.world_size = int(os.environ['SLURM_NPROCS'])
         args.local_rank = args.rank % torch.cuda.device_count()
-    elif hasattr(args, 'rank'):
-        pass
     else:
-        args.rank = 0
-        args.world_size = 1
-        args.local_rank = 0
+        # Not launched with torchrun - print helpful error message
+        print("\n" + "="*70)
+        print("⚠️  ERROR: DDP requires launching with torchrun")
+        print("="*70)
+        print(f"You have {torch.cuda.device_count()} GPUs available.")
+        print("\nTo use DDP with multiple GPUs, launch with:\n")
+        print(f"  torchrun --nproc_per_node={torch.cuda.device_count()} train_ultimate.py train --use-ddp [other args]")
+        print("\nExample:")
+        print(f"  torchrun --nproc_per_node=2 train_ultimate.py train \\")
+        print(f"    --dataset-path /path/to/dataset \\")
+        print(f"    --use-ddp --batch-size 8 --epochs 200")
+        print("\nAlternatively, remove --use-ddp flag to train on single GPU.")
+        print("="*70 + "\n")
+        raise RuntimeError("DDP requires torchrun. See error message above for instructions.")
 
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend='nccl', init_method='env://',
