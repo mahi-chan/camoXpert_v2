@@ -77,7 +77,9 @@ class CamoXpertSparseMoE(nn.Module):
         # 1. Backbone
         print("\n[1/7] Loading backbone...")
         self.backbone = self._create_backbone(backbone, pretrained)
-        self.feature_dims = [80, 160, 288, 584]  # EdgeNeXt feature dimensions
+
+        # Auto-detect feature dimensions based on backbone
+        self.feature_dims = self._get_feature_dims(backbone)
         print(f"✓ Backbone loaded: {backbone}")
         print(f"✓ Feature dimensions: {self.feature_dims}")
 
@@ -141,8 +143,48 @@ class CamoXpertSparseMoE(nn.Module):
         print(f"  Specialization:        100% COD-Optimized + Sparse MoE")
         print("="*70)
 
+    def _get_feature_dims(self, backbone_name):
+        """Get feature dimensions for different backbones"""
+        # Feature dimensions: [stage1, stage2, stage3, stage4]
+        backbone_dims = {
+            # PVTv2 (SOTA for COD)
+            'pvt_v2_b0': [32, 64, 160, 256],
+            'pvt_v2_b1': [64, 128, 320, 512],
+            'pvt_v2_b2': [64, 128, 320, 512],
+            'pvt_v2_b3': [64, 128, 320, 512],
+            'pvt_v2_b4': [64, 128, 320, 512],
+            'pvt_v2_b5': [64, 128, 320, 512],
+            # EdgeNeXt (mobile-optimized)
+            'edgenext_small': [48, 96, 160, 304],
+            'edgenext_base': [80, 160, 288, 584],
+            'edgenext_small_rw': [48, 96, 192, 384],
+            # Swin Transformer
+            'swin_tiny_patch4_window7_224': [96, 192, 384, 768],
+            'swin_small_patch4_window7_224': [96, 192, 384, 768],
+            'swin_base_patch4_window7_224': [128, 256, 512, 1024],
+            # ConvNeXt
+            'convnext_tiny': [96, 192, 384, 768],
+            'convnext_small': [96, 192, 384, 768],
+            'convnext_base': [128, 256, 512, 1024],
+        }
+
+        if backbone_name in backbone_dims:
+            return backbone_dims[backbone_name]
+        else:
+            # Try to infer from backbone name
+            if 'pvt_v2' in backbone_name:
+                return [64, 128, 320, 512]  # PVTv2 default
+            elif 'edgenext' in backbone_name:
+                return [80, 160, 288, 584]  # EdgeNeXt default
+            elif 'swin' in backbone_name:
+                return [96, 192, 384, 768]  # Swin default
+            elif 'convnext' in backbone_name:
+                return [96, 192, 384, 768]  # ConvNeXt default
+            else:
+                raise ValueError(f"Unknown backbone: {backbone_name}. Please add feature dims to _get_feature_dims()")
+
     def _create_backbone(self, backbone_name, pretrained):
-        """Load EdgeNeXt backbone"""
+        """Load backbone from timm"""
         import timm
         backbone = timm.create_model(backbone_name, pretrained=pretrained, features_only=True)
         return backbone

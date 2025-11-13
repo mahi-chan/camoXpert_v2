@@ -34,7 +34,8 @@ def parse_args():
     parser.add_argument('command', type=str, choices=['train'])
     parser.add_argument('--dataset-path', type=str, required=True)
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints')
-    parser.add_argument('--backbone', type=str, default='edgenext_base')
+    parser.add_argument('--backbone', type=str, default='pvt_v2_b2',
+                        help='Backbone: pvt_v2_b2 (SOTA for COD, recommended), edgenext_base (mobile), swin_tiny, convnext_tiny')
     parser.add_argument('--num-experts', type=int, default=7)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--accumulation-steps', type=int, default=4)
@@ -284,8 +285,9 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
     optimizer.zero_grad(set_to_none=True)
 
     # Calculate router warmup factor for Sparse MoE
-    # Gradually increase load balance loss over first 20 epochs
-    router_warmup_epochs = 20
+    # Gradually increase load balance loss over FULL Stage 1 (40 epochs)
+    # CRITICAL: Changed from 20 to 40 epochs after explosion at epoch 10
+    router_warmup_epochs = 40
     if use_sparse_moe and epoch < router_warmup_epochs:
         router_warmup_factor = (epoch + 1) / router_warmup_epochs
     else:
@@ -675,8 +677,30 @@ def train(args):
         for param in actual_model.backbone.parameters():
             param.requires_grad = False
 
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
-                          lr=args.lr, weight_decay=args.weight_decay)
+        # Separate learning rates for router vs other parameters (if using sparse MoE)
+        if args.use_sparse_moe:
+            router_params = []
+            other_params = []
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    # Router/gate parameters get 0.01× learning rate for stability
+                    if 'router' in name or 'gate' in name:
+                        router_params.append(param)
+                    else:
+                        other_params.append(param)
+
+            # CRITICAL: Router LR = 0.01× main LR for stability at 416px
+            optimizer = AdamW([
+                {'params': other_params, 'lr': args.lr},
+                {'params': router_params, 'lr': args.lr * 0.01}  # 100× slower for router
+            ], weight_decay=args.weight_decay)
+
+            if is_main_process:
+                print(f"🎯 Sparse MoE: Router LR = {args.lr * 0.01:.6f} (0.01× main LR)")
+                print(f"   Other params LR = {args.lr:.6f}")
+        else:
+            optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                              lr=args.lr, weight_decay=args.weight_decay)
 
         # Create scheduler for Stage 1
         total_steps = len(train_loader) * args.stage1_epochs // args.accumulation_steps
@@ -846,9 +870,31 @@ def train(args):
             print(f"  Min LR: {args.min_lr}")
 
     # Create optimizer with unwrapped model (DataParallel compatible)
-    # In Stage 2, backbone is unfrozen - use same LR for all params to avoid scheduler conflicts
+    # In Stage 2, backbone is unfrozen
     actual_model = get_actual_model(model)
-    optimizer = AdamW(actual_model.parameters(), lr=stage2_lr, weight_decay=args.weight_decay)
+
+    # Separate learning rates for router (if using sparse MoE)
+    if args.use_sparse_moe:
+        router_params = []
+        other_params = []
+        for name, param in actual_model.named_parameters():
+            # Router/gate parameters get 0.01× learning rate for stability
+            if 'router' in name or 'gate' in name:
+                router_params.append(param)
+            else:
+                other_params.append(param)
+
+        # CRITICAL: Router LR = 0.01× main LR for stability
+        optimizer = AdamW([
+            {'params': other_params, 'lr': stage2_lr},
+            {'params': router_params, 'lr': stage2_lr * 0.01}  # 100× slower for router
+        ], weight_decay=args.weight_decay)
+
+        if is_main_process:
+            print(f"🎯 Sparse MoE: Router LR = {stage2_lr * 0.01:.6f} (0.01× main LR)")
+            print(f"   Other params LR = {stage2_lr:.6f}")
+    else:
+        optimizer = AdamW(actual_model.parameters(), lr=stage2_lr, weight_decay=args.weight_decay)
 
     # Create scheduler for Stage 2
     total_steps = len(train_loader) * (args.epochs - args.stage1_epochs) // args.accumulation_steps
