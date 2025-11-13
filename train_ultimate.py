@@ -279,7 +279,7 @@ def warmup_lr(optimizer, epoch, warmup_epochs, base_lr):
 
 
 def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps, ema, epoch, total_epochs,
-                use_deep_sup, use_amp=True, use_sparse_moe=False):
+                use_deep_sup, use_amp=True, use_sparse_moe=False, use_cod_specialized=False):
     model.train()
     epoch_loss = 0
     optimizer.zero_grad(set_to_none=True)
@@ -288,7 +288,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
     # Gradually increase load balance loss over FULL Stage 1 (40 epochs)
     # CRITICAL: Changed from 20 to 40 epochs after explosion at epoch 10
     router_warmup_epochs = 40
-    if use_sparse_moe and epoch < router_warmup_epochs:
+    if use_sparse_moe and use_cod_specialized and epoch < router_warmup_epochs:
         router_warmup_factor = (epoch + 1) / router_warmup_epochs
     else:
         router_warmup_factor = 1.0
@@ -306,8 +306,8 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
             context = torch.cuda.amp.autocast(enabled=False)
 
         with context:
-            # Pass warmup factor to model if using sparse MoE
-            if use_sparse_moe:
+            # Pass warmup factor to model ONLY if using CamoXpertSparseMoE (requires both flags)
+            if use_sparse_moe and use_cod_specialized:
                 pred, aux_or_dict, deep = model(images, return_deep_supervision=use_deep_sup,
                                                 warmup_factor=router_warmup_factor)
             else:
@@ -728,7 +728,8 @@ def train(args):
 
             train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler,
                                      args.accumulation_steps, ema, epoch, args.stage1_epochs, args.deep_supervision,
-                                     use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe)
+                                     use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe,
+                                     use_cod_specialized=args.use_cod_specialized)
 
             # Step scheduler if it exists
             if scheduler is not None:
@@ -961,7 +962,8 @@ def train(args):
 
         train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler,
                                  args.accumulation_steps, ema, epoch, args.epochs, args.deep_supervision,
-                                 use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe)
+                                 use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe,
+                                 use_cod_specialized=args.use_cod_specialized)
 
         # Step scheduler if not in warmup and scheduler exists
         if not in_warmup and scheduler is not None:
