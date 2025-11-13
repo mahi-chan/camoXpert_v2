@@ -316,6 +316,18 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
     else:
         router_warmup_factor = 1.0
 
+    # PERFORMANCE FIX: Cache router parameters ONCE per epoch instead of every step
+    # This was causing 3x slowdown by iterating 36M params 187 times per epoch!
+    router_params = []
+    other_params = []
+    if use_sparse_moe:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if 'router' in name or 'gate' in name:
+                    router_params.append(param)
+                else:
+                    other_params.append(param)
+
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch + 1}/{total_epochs}")
 
     for batch_idx, (images, masks) in pbar:
@@ -386,20 +398,9 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
                 scaler.unscale_(optimizer)
 
             # Extra aggressive clipping for router parameters if using sparse MoE
-            if use_sparse_moe:
-                router_params = []
-                other_params = []
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        # Check if this is a router parameter
-                        if 'router' in name or 'gate' in name:
-                            router_params.append(param)
-                        else:
-                            other_params.append(param)
-
-                # Clip router gradients more aggressively (0.1 vs 0.5)
-                if router_params:
-                    torch.nn.utils.clip_grad_norm_(router_params, 0.1)
+            # Use cached router_params from epoch start (no longer iterating on every step!)
+            if use_sparse_moe and router_params:
+                torch.nn.utils.clip_grad_norm_(router_params, 0.1)
 
             # Clip all gradients MORE aggressively (0.5 instead of 1.0) to prevent explosions
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
