@@ -55,9 +55,9 @@ class AdvancedCODLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
-        # Cast sobel filters to match input device AND dtype (critical for DDP)
-        sobel_x = self.sobel_x.to(pred)
-        sobel_y = self.sobel_y.to(pred)
+        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
+        sobel_x = self.sobel_x if self.sobel_x.dtype == pred.dtype else self.sobel_x.type(pred.dtype)
+        sobel_y = self.sobel_y if self.sobel_y.dtype == pred.dtype else self.sobel_y.type(pred.dtype)
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -180,9 +180,9 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)
 
-        # Cast sobel filters to match input device AND dtype (critical for DDP)
-        sobel_x = self.sobel_x.to(pred)
-        sobel_y = self.sobel_y.to(pred)
+        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
+        sobel_x = self.sobel_x if self.sobel_x.dtype == pred.dtype else self.sobel_x.type(pred.dtype)
+        sobel_y = self.sobel_y if self.sobel_y.dtype == pred.dtype else self.sobel_y.type(pred.dtype)
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -203,8 +203,8 @@ class CODSpecializedLoss(nn.Module):
         """
         pred = torch.clamp(pred, min=-15, max=15)
 
-        # Cast boundary kernel to match input device AND dtype (critical for DDP)
-        boundary_kernel = self.boundary_kernel.to(target)
+        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
+        boundary_kernel = self.boundary_kernel if self.boundary_kernel.dtype == target.dtype else self.boundary_kernel.type(target.dtype)
 
         # Extract boundaries using morphological operations (use cached kernel!)
         dilated = F.conv2d(target, boundary_kernel, padding=1)
