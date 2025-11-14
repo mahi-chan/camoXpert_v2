@@ -55,9 +55,9 @@ class AdvancedCODLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
-        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
-        sobel_x = self.sobel_x if self.sobel_x.dtype == pred.dtype else self.sobel_x.type(pred.dtype)
-        sobel_y = self.sobel_y if self.sobel_y.dtype == pred.dtype else self.sobel_y.type(pred.dtype)
+        # Match both device and dtype (DDP may have buffers on different device initially)
+        sobel_x = self.sobel_x.to(pred.device, dtype=pred.dtype)
+        sobel_y = self.sobel_y.to(pred.device, dtype=pred.dtype)
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -180,9 +180,9 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)
 
-        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
-        sobel_x = self.sobel_x if self.sobel_x.dtype == pred.dtype else self.sobel_x.type(pred.dtype)
-        sobel_y = self.sobel_y if self.sobel_y.dtype == pred.dtype else self.sobel_y.type(pred.dtype)
+        # Match both device and dtype (DDP may have buffers on different device initially)
+        sobel_x = self.sobel_x.to(pred.device, dtype=pred.dtype)
+        sobel_y = self.sobel_y.to(pred.device, dtype=pred.dtype)
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -203,8 +203,8 @@ class CODSpecializedLoss(nn.Module):
         """
         pred = torch.clamp(pred, min=-15, max=15)
 
-        # Buffers are on correct device (auto-moved with DDP), only cast dtype if needed
-        boundary_kernel = self.boundary_kernel if self.boundary_kernel.dtype == target.dtype else self.boundary_kernel.type(target.dtype)
+        # Match both device and dtype (DDP may have buffers on different device initially)
+        boundary_kernel = self.boundary_kernel.to(target.device, dtype=target.dtype)
 
         # Extract boundaries using morphological operations (use cached kernel!)
         dilated = F.conv2d(target, boundary_kernel, padding=1)
