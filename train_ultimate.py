@@ -707,20 +707,20 @@ def train(args):
             other_params = []
             for name, param in model.named_parameters():
                 if param.requires_grad:
-                    # Router/gate parameters get 0.01× learning rate for stability
+                    # Router/gate parameters get 0.1× learning rate for Stage 1 (learn routing from scratch)
                     if 'router' in name or 'gate' in name:
                         router_params.append(param)
                     else:
                         other_params.append(param)
 
-            # CRITICAL: Router LR = 0.01× main LR for stability at 416px
+            # STAGE 1: Router LR = 0.1× main LR (needs to learn routing from scratch)
             optimizer = AdamW([
                 {'params': other_params, 'lr': args.lr},
-                {'params': router_params, 'lr': args.lr * 0.01}  # 100× slower for router
+                {'params': router_params, 'lr': args.lr * 0.1}  # 10× slower for router
             ], weight_decay=args.weight_decay)
 
             if is_main_process:
-                print(f"🎯 Sparse MoE: Router LR = {args.lr * 0.01:.6f} (0.01× main LR)")
+                print(f"🎯 Stage 1 Sparse MoE: Router LR = {args.lr * 0.1:.6f} (0.1× main LR)")
                 print(f"   Other params LR = {args.lr:.6f}")
         else:
             optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
@@ -909,20 +909,20 @@ def train(args):
         router_params = []
         other_params = []
         for name, param in actual_model.named_parameters():
-            # Router/gate parameters get 0.01× learning rate for stability
+            # Router/gate parameters get 0.01× learning rate for Stage 2 (conservative fine-tuning)
             if 'router' in name or 'gate' in name:
                 router_params.append(param)
             else:
                 other_params.append(param)
 
-        # CRITICAL: Router LR = 0.01× main LR for stability
+        # STAGE 2: Router LR = 0.01× main LR (conservative for fine-tuning)
         optimizer = AdamW([
             {'params': other_params, 'lr': stage2_lr},
             {'params': router_params, 'lr': stage2_lr * 0.01}  # 100× slower for router
         ], weight_decay=args.weight_decay)
 
         if is_main_process:
-            print(f"🎯 Sparse MoE: Router LR = {stage2_lr * 0.01:.6f} (0.01× main LR)")
+            print(f"🎯 Stage 2 Sparse MoE: Router LR = {stage2_lr * 0.01:.6f} (0.01× main LR)")
             print(f"   Other params LR = {stage2_lr:.6f}")
     else:
         optimizer = AdamW(actual_model.parameters(), lr=stage2_lr, weight_decay=args.weight_decay)
