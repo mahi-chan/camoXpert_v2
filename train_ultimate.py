@@ -824,15 +824,21 @@ def train(args):
         print("🧹 Cleaning up memory before Stage 2...")
         del optimizer, scheduler
 
-        # Recreate DDP wrapper with find_unused_parameters=False for Stage 2
+        # Recreate DDP wrapper for Stage 2
+        # Use find_unused_parameters=True if progressive unfreezing (frozen params = unused)
         if args.use_ddp and n_gpus > 1:
             # Unwrap model from DDP
             actual_model = model.module
-            # Recreate DDP with optimized settings for Stage 2 (no unused params)
+            # Check if we need find_unused_parameters for progressive unfreezing
+            use_find_unused = args.progressive_unfreeze
+            # Recreate DDP with appropriate settings
             model = DDP(actual_model, device_ids=[args.local_rank], output_device=args.local_rank,
-                       find_unused_parameters=False)
+                       find_unused_parameters=use_find_unused)
             if is_main_process:
-                print("   ✓ Recreated DDP wrapper with find_unused_parameters=False")
+                print(f"   ✓ Recreated DDP wrapper with find_unused_parameters={use_find_unused}")
+                if use_find_unused:
+                    print(f"     (Required for progressive unfreezing)")
+
 
         clear_gpu_memory()
         print_gpu_memory()
