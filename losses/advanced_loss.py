@@ -36,6 +36,10 @@ class AdvancedCODLoss(nn.Module):
         self.register_buffer('sobel_x', sobel_x)
         self.register_buffer('sobel_y', sobel_y)
 
+        # Cache for FP16 versions (avoid .to() overhead every forward)
+        self._sobel_x_fp16 = None
+        self._sobel_y_fp16 = None
+
     def iou_loss(self, pred, target):
         """IoU loss"""
         # Clamp logits to prevent NaN in mixed precision
@@ -55,9 +59,16 @@ class AdvancedCODLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
-        # Match both device and dtype (DDP may have buffers on different device initially)
-        sobel_x = self.sobel_x.to(pred.device, dtype=pred.dtype)
-        sobel_y = self.sobel_y.to(pred.device, dtype=pred.dtype)
+        # Use cached FP16 versions to avoid .to() overhead every forward
+        if pred.dtype == torch.float16:
+            if self._sobel_x_fp16 is None:
+                self._sobel_x_fp16 = self.sobel_x.half()
+                self._sobel_y_fp16 = self.sobel_y.half()
+            sobel_x = self._sobel_x_fp16
+            sobel_y = self._sobel_y_fp16
+        else:
+            sobel_x = self.sobel_x
+            sobel_y = self.sobel_y
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -163,6 +174,11 @@ class CODSpecializedLoss(nn.Module):
         self.register_buffer('sobel_y', sobel_y)
         self.register_buffer('boundary_kernel', boundary_kernel)
 
+        # Cache for FP16 versions (avoid .to() overhead every forward)
+        self._sobel_x_fp16 = None
+        self._sobel_y_fp16 = None
+        self._boundary_kernel_fp16 = None
+
     def iou_loss(self, pred, target):
         """IoU loss"""
         pred = torch.clamp(pred, min=-15, max=15)
@@ -180,9 +196,16 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
         pred = torch.sigmoid(pred)
 
-        # Match both device and dtype (DDP may have buffers on different device initially)
-        sobel_x = self.sobel_x.to(pred.device, dtype=pred.dtype)
-        sobel_y = self.sobel_y.to(pred.device, dtype=pred.dtype)
+        # Use cached FP16 versions to avoid .to() overhead every forward
+        if pred.dtype == torch.float16:
+            if self._sobel_x_fp16 is None:
+                self._sobel_x_fp16 = self.sobel_x.half()
+                self._sobel_y_fp16 = self.sobel_y.half()
+            sobel_x = self._sobel_x_fp16
+            sobel_y = self._sobel_y_fp16
+        else:
+            sobel_x = self.sobel_x
+            sobel_y = self.sobel_y
 
         # Use cached sobel filters (no tensor creation overhead!)
         pred_edge_x = F.conv2d(pred, sobel_x, padding=1)
@@ -203,8 +226,13 @@ class CODSpecializedLoss(nn.Module):
         """
         pred = torch.clamp(pred, min=-15, max=15)
 
-        # Match both device and dtype (DDP may have buffers on different device initially)
-        boundary_kernel = self.boundary_kernel.to(target.device, dtype=target.dtype)
+        # Use cached FP16 version to avoid .to() overhead every forward
+        if target.dtype == torch.float16:
+            if self._boundary_kernel_fp16 is None:
+                self._boundary_kernel_fp16 = self.boundary_kernel.half()
+            boundary_kernel = self._boundary_kernel_fp16
+        else:
+            boundary_kernel = self.boundary_kernel
 
         # Extract boundaries using morphological operations (use cached kernel!)
         dilated = F.conv2d(target, boundary_kernel, padding=1)
