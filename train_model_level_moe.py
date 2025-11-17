@@ -420,16 +420,16 @@ def main():
 
     # Data
     train_dataset = COD10KDataset(
-        root=args.data_root,
+        root_dir=args.data_root,
         split='train',
         img_size=args.img_size,
-        cache_in_ram=True
+        cache_in_memory=True
     )
     val_dataset = COD10KDataset(
-        root=args.data_root,
+        root_dir=args.data_root,
         split='test',
         img_size=args.img_size,
-        cache_in_ram=True
+        cache_in_memory=True
     )
 
     if args.use_ddp:
