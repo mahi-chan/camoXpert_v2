@@ -60,10 +60,11 @@ class AdvancedCODLoss(nn.Module):
         pred = torch.sigmoid(pred)  # Apply sigmoid here
 
         # Use cached FP16 versions to avoid .to() overhead every forward
+        # Cache per device to handle DDP (each rank has different device)
         if pred.dtype == torch.float16:
-            if self._sobel_x_fp16 is None:
-                self._sobel_x_fp16 = self.sobel_x.half()
-                self._sobel_y_fp16 = self.sobel_y.half()
+            if self._sobel_x_fp16 is None or self._sobel_x_fp16.device != pred.device:
+                self._sobel_x_fp16 = self.sobel_x.half().to(pred.device)
+                self._sobel_y_fp16 = self.sobel_y.half().to(pred.device)
             sobel_x = self._sobel_x_fp16
             sobel_y = self._sobel_y_fp16
         else:
@@ -197,10 +198,11 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.sigmoid(pred)
 
         # Use cached FP16 versions to avoid .to() overhead every forward
+        # Cache per device to handle DDP (each rank has different device)
         if pred.dtype == torch.float16:
-            if self._sobel_x_fp16 is None:
-                self._sobel_x_fp16 = self.sobel_x.half()
-                self._sobel_y_fp16 = self.sobel_y.half()
+            if self._sobel_x_fp16 is None or self._sobel_x_fp16.device != pred.device:
+                self._sobel_x_fp16 = self.sobel_x.half().to(pred.device)
+                self._sobel_y_fp16 = self.sobel_y.half().to(pred.device)
             sobel_x = self._sobel_x_fp16
             sobel_y = self._sobel_y_fp16
         else:
@@ -227,9 +229,10 @@ class CODSpecializedLoss(nn.Module):
         pred = torch.clamp(pred, min=-15, max=15)
 
         # Use cached FP16 version to avoid .to() overhead every forward
+        # Cache per device to handle DDP (each rank has different device)
         if target.dtype == torch.float16:
-            if self._boundary_kernel_fp16 is None:
-                self._boundary_kernel_fp16 = self.boundary_kernel.half()
+            if self._boundary_kernel_fp16 is None or self._boundary_kernel_fp16.device != target.device:
+                self._boundary_kernel_fp16 = self.boundary_kernel.half().to(target.device)
             boundary_kernel = self._boundary_kernel_fp16
         else:
             boundary_kernel = self.boundary_kernel
