@@ -120,20 +120,43 @@ class EMA:
 
 
 def setup_ddp(args):
-    """Initialize DistributedDataParallel"""
+    """
+    Initialize DistributedDataParallel
+
+    NOTE: For multi-GPU training with DDP, you must launch with torchrun:
+        torchrun --nproc_per_node=2 train_ultimate.py train --use-ddp ...
+    """
+    # Set default MASTER_ADDR and MASTER_PORT for single-node training if not set
+    if 'MASTER_ADDR' not in os.environ:
+        os.environ['MASTER_ADDR'] = 'localhost'
+    if 'MASTER_PORT' not in os.environ:
+        os.environ['MASTER_PORT'] = '12355'
+
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # Launched with torchrun or torch.distributed.launch
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ["WORLD_SIZE"])
         args.local_rank = int(os.environ["LOCAL_RANK"])
     elif 'SLURM_PROCID' in os.environ:
+        # Running on SLURM cluster
         args.rank = int(os.environ['SLURM_PROCID'])
+        args.world_size = int(os.environ['SLURM_NPROCS'])
         args.local_rank = args.rank % torch.cuda.device_count()
-    elif hasattr(args, 'rank'):
-        pass
     else:
-        args.rank = 0
-        args.world_size = 1
-        args.local_rank = 0
+        # Not launched with torchrun - print helpful error message
+        print("\n" + "="*70)
+        print("⚠️  ERROR: DDP requires launching with torchrun")
+        print("="*70)
+        print(f"You have {torch.cuda.device_count()} GPUs available.")
+        print("\nTo use DDP with multiple GPUs, launch with:\n")
+        print(f"  torchrun --nproc_per_node={torch.cuda.device_count()} train_ultimate.py train --use-ddp [other args]")
+        print("\nExample:")
+        print(f"  torchrun --nproc_per_node=2 train_ultimate.py train \\")
+        print(f"    --dataset-path /path/to/dataset \\")
+        print(f"    --use-ddp --batch-size 8 --epochs 200")
+        print("\nAlternatively, remove --use-ddp flag to train on single GPU.")
+        print("="*70 + "\n")
+        raise RuntimeError("DDP requires torchrun. See error message above for instructions.")
 
     torch.cuda.set_device(args.local_rank)
     dist.init_process_group(backend='nccl', init_method='env://',
@@ -279,7 +302,7 @@ def warmup_lr(optimizer, epoch, warmup_epochs, base_lr):
 
 
 def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps, ema, epoch, total_epochs,
-                use_deep_sup, use_amp=True, use_sparse_moe=False):
+                use_deep_sup, use_amp=True, use_sparse_moe=False, use_cod_specialized=False):
     model.train()
     epoch_loss = 0
     optimizer.zero_grad(set_to_none=True)
@@ -288,10 +311,22 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
     # Gradually increase load balance loss over FULL Stage 1 (40 epochs)
     # CRITICAL: Changed from 20 to 40 epochs after explosion at epoch 10
     router_warmup_epochs = 40
-    if use_sparse_moe and epoch < router_warmup_epochs:
+    if use_sparse_moe and use_cod_specialized and epoch < router_warmup_epochs:
         router_warmup_factor = (epoch + 1) / router_warmup_epochs
     else:
         router_warmup_factor = 1.0
+
+    # PERFORMANCE FIX: Cache router parameters ONCE per epoch instead of every step
+    # This was causing 3x slowdown by iterating 36M params 187 times per epoch!
+    router_params = []
+    other_params = []
+    if use_sparse_moe:
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if 'router' in name or 'gate' in name:
+                    router_params.append(param)
+                else:
+                    other_params.append(param)
 
     pbar = tqdm(enumerate(loader), total=len(loader), desc=f"Epoch {epoch + 1}/{total_epochs}")
 
@@ -306,8 +341,8 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
             context = torch.cuda.amp.autocast(enabled=False)
 
         with context:
-            # Pass warmup factor to model if using sparse MoE
-            if use_sparse_moe:
+            # Pass warmup factor to model ONLY if using CamoXpertSparseMoE (requires both flags)
+            if use_sparse_moe and use_cod_specialized:
                 pred, aux_or_dict, deep = model(images, return_deep_supervision=use_deep_sup,
                                                 warmup_factor=router_warmup_factor)
             else:
@@ -363,20 +398,9 @@ def train_epoch(model, loader, criterion, optimizer, scaler, accumulation_steps,
                 scaler.unscale_(optimizer)
 
             # Extra aggressive clipping for router parameters if using sparse MoE
-            if use_sparse_moe:
-                router_params = []
-                other_params = []
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        # Check if this is a router parameter
-                        if 'router' in name or 'gate' in name:
-                            router_params.append(param)
-                        else:
-                            other_params.append(param)
-
-                # Clip router gradients more aggressively (0.1 vs 0.5)
-                if router_params:
-                    torch.nn.utils.clip_grad_norm_(router_params, 0.1)
+            # Use cached router_params from epoch start (no longer iterating on every step!)
+            if use_sparse_moe and router_params:
+                torch.nn.utils.clip_grad_norm_(router_params, 0.1)
 
             # Clip all gradients MORE aggressively (0.5 instead of 1.0) to prevent explosions
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
@@ -683,20 +707,20 @@ def train(args):
             other_params = []
             for name, param in model.named_parameters():
                 if param.requires_grad:
-                    # Router/gate parameters get 0.01× learning rate for stability
+                    # Router/gate parameters get 0.1× learning rate for Stage 1 (learn routing from scratch)
                     if 'router' in name or 'gate' in name:
                         router_params.append(param)
                     else:
                         other_params.append(param)
 
-            # CRITICAL: Router LR = 0.01× main LR for stability at 416px
+            # STAGE 1: Router LR = 0.1× main LR (needs to learn routing from scratch)
             optimizer = AdamW([
                 {'params': other_params, 'lr': args.lr},
-                {'params': router_params, 'lr': args.lr * 0.01}  # 100× slower for router
+                {'params': router_params, 'lr': args.lr * 0.1}  # 10× slower for router
             ], weight_decay=args.weight_decay)
 
             if is_main_process:
-                print(f"🎯 Sparse MoE: Router LR = {args.lr * 0.01:.6f} (0.01× main LR)")
+                print(f"🎯 Stage 1 Sparse MoE: Router LR = {args.lr * 0.1:.6f} (0.1× main LR)")
                 print(f"   Other params LR = {args.lr:.6f}")
         else:
             optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
@@ -728,7 +752,8 @@ def train(args):
 
             train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler,
                                      args.accumulation_steps, ema, epoch, args.stage1_epochs, args.deep_supervision,
-                                     use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe)
+                                     use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe,
+                                     use_cod_specialized=args.use_cod_specialized)
 
             # Step scheduler if it exists
             if scheduler is not None:
@@ -799,15 +824,21 @@ def train(args):
         print("🧹 Cleaning up memory before Stage 2...")
         del optimizer, scheduler
 
-        # Recreate DDP wrapper with find_unused_parameters=False for Stage 2
+        # Recreate DDP wrapper for Stage 2
+        # Use find_unused_parameters=True if progressive unfreezing (frozen params = unused)
         if args.use_ddp and n_gpus > 1:
             # Unwrap model from DDP
             actual_model = model.module
-            # Recreate DDP with optimized settings for Stage 2 (no unused params)
+            # Check if we need find_unused_parameters for progressive unfreezing
+            use_find_unused = args.progressive_unfreeze
+            # Recreate DDP with appropriate settings
             model = DDP(actual_model, device_ids=[args.local_rank], output_device=args.local_rank,
-                       find_unused_parameters=False)
+                       find_unused_parameters=use_find_unused)
             if is_main_process:
-                print("   ✓ Recreated DDP wrapper with find_unused_parameters=False")
+                print(f"   ✓ Recreated DDP wrapper with find_unused_parameters={use_find_unused}")
+                if use_find_unused:
+                    print(f"     (Required for progressive unfreezing)")
+
 
         clear_gpu_memory()
         print_gpu_memory()
@@ -878,20 +909,20 @@ def train(args):
         router_params = []
         other_params = []
         for name, param in actual_model.named_parameters():
-            # Router/gate parameters get 0.01× learning rate for stability
+            # Router/gate parameters get 0.01× learning rate for Stage 2 (conservative fine-tuning)
             if 'router' in name or 'gate' in name:
                 router_params.append(param)
             else:
                 other_params.append(param)
 
-        # CRITICAL: Router LR = 0.01× main LR for stability
+        # STAGE 2: Router LR = 0.01× main LR (conservative for fine-tuning)
         optimizer = AdamW([
             {'params': other_params, 'lr': stage2_lr},
             {'params': router_params, 'lr': stage2_lr * 0.01}  # 100× slower for router
         ], weight_decay=args.weight_decay)
 
         if is_main_process:
-            print(f"🎯 Sparse MoE: Router LR = {stage2_lr * 0.01:.6f} (0.01× main LR)")
+            print(f"🎯 Stage 2 Sparse MoE: Router LR = {stage2_lr * 0.01:.6f} (0.01× main LR)")
             print(f"   Other params LR = {stage2_lr:.6f}")
     else:
         optimizer = AdamW(actual_model.parameters(), lr=stage2_lr, weight_decay=args.weight_decay)
@@ -961,7 +992,8 @@ def train(args):
 
         train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler,
                                  args.accumulation_steps, ema, epoch, args.epochs, args.deep_supervision,
-                                 use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe)
+                                 use_amp=not args.no_amp, use_sparse_moe=args.use_sparse_moe,
+                                 use_cod_specialized=args.use_cod_specialized)
 
         # Step scheduler if not in warmup and scheduler exists
         if not in_warmup and scheduler is not None:
