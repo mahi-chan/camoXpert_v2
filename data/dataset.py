@@ -7,12 +7,24 @@ from albumentations.pytorch import ToTensorV2
 
 
 class COD10KDataset(Dataset):
-    def __init__(self, root_dir, split='train', img_size=352, augment=True, cache_in_memory=True):
+    def __init__(self, root_dir, split='train', img_size=352, augment=True, cache_in_memory=True,
+                 rank=0, world_size=1):
+        """
+        Args:
+            rank: DDP rank (0, 1, 2, ...) - which GPU process this is
+            world_size: Total number of DDP processes
+
+        DDP-aware caching: Each process only caches images it will actually use
+        - rank=0, world_size=2: caches indices [0, 2, 4, 6, ...]
+        - rank=1, world_size=2: caches indices [1, 3, 5, 7, ...]
+        """
         self.root_dir = root_dir
         self.split = split
         self.img_size = img_size
         self.augment = augment and split == 'train'
         self.cache_in_memory = cache_in_memory
+        self.rank = rank
+        self.world_size = world_size
 
         # Try multiple possible directory structures
         possible_structures = [
@@ -97,9 +109,18 @@ class COD10KDataset(Dataset):
         self.mask_cache = {}
 
         if self.cache_in_memory:
-            print(f"  Caching {len(self.image_list)} RESIZED images ({img_size}px) in RAM...")
+            # DDP-aware caching: only cache images this rank will use
+            if self.world_size > 1:
+                # Calculate which indices this rank will handle
+                indices_to_cache = list(range(self.rank, len(self.image_list), self.world_size))
+                images_to_cache = [self.image_list[i] for i in indices_to_cache]
+                print(f"  [Rank {self.rank}/{self.world_size}] Caching {len(images_to_cache)}/{len(self.image_list)} RESIZED images ({img_size}px) in RAM...")
+            else:
+                images_to_cache = self.image_list
+                print(f"  Caching {len(images_to_cache)} RESIZED images ({img_size}px) in RAM...")
+
             from tqdm import tqdm
-            for img_name in tqdm(self.image_list, desc=f"Loading {split}"):
+            for img_name in tqdm(images_to_cache, desc=f"Loading {split} [Rank {self.rank}]"):
                 # Load image
                 img_path = os.path.join(self.image_dir, img_name)
                 image = cv2.imread(img_path)
@@ -126,7 +147,10 @@ class COD10KDataset(Dataset):
                 self.mask_cache[img_name] = (mask > 128).astype(np.float32)
 
             mem_mb = len(self.image_cache) * img_size * img_size * 3 / (1024**2)
-            print(f"  ✓ Cached {len(self.image_cache)} images in RAM (~{mem_mb:.0f}MB)")
+            if self.world_size > 1:
+                print(f"  ✓ [Rank {self.rank}] Cached {len(self.image_cache)} images in RAM (~{mem_mb:.0f}MB)")
+            else:
+                print(f"  ✓ Cached {len(self.image_cache)} images in RAM (~{mem_mb:.0f}MB)")
 
         if self.augment:
             # NO RESIZE in transform - already done in cache!
@@ -151,17 +175,20 @@ class COD10KDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.image_list[idx]
 
-        if self.cache_in_memory:
+        # Check if cached (DDP-aware caching may not have all images)
+        if self.cache_in_memory and img_name in self.image_cache:
             # Get from RAM cache (fast!)
             image = self.image_cache[img_name].copy()  # Copy to avoid modifying cache
             mask = self.mask_cache[img_name].copy()
         else:
-            # Load from disk (slow - fallback only)
+            # Load from disk (happens when: 1) caching disabled, or 2) cache miss in DDP)
             img_path = os.path.join(self.image_dir, img_name)
             image = cv2.imread(img_path)
             if image is None:
                 raise ValueError(f"Failed to load image: {img_path}")
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # RESIZE to match cached images
+            image = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
 
             # Try multiple mask extensions
             mask_extensions = ['.png', '.jpg', '.jpeg', '.PNG', '.JPG']
@@ -177,6 +204,8 @@ class COD10KDataset(Dataset):
             if mask is None:
                 raise ValueError(f"Failed to load mask for: {img_name}")
 
+            # RESIZE mask too
+            mask = cv2.resize(mask, (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
             mask = (mask > 128).astype(np.float32)
 
         transformed = self.transform(image=image, mask=mask)

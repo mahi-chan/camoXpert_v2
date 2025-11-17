@@ -419,21 +419,26 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # Data
-    # Disable caching with DDP to save memory (each process would cache separately)
-    # With 2 GPUs: 2 × (6000 + 800) images = 13,600 cached images = 26GB RAM!
-    should_cache = not args.use_ddp
+    # DDP-aware caching: Each process only caches images it will actually use
+    # Rank 0: caches indices [0, 2, 4, ...] → 3000 train + 400 val
+    # Rank 1: caches indices [1, 3, 5, ...] → 3000 train + 400 val
+    # Total: 6800 images (same as single GPU!) instead of 13,600
 
     train_dataset = COD10KDataset(
         root_dir=args.data_root,
         split='train',
         img_size=args.img_size,
-        cache_in_memory=should_cache
+        cache_in_memory=True,
+        rank=args.rank if args.use_ddp else 0,
+        world_size=args.world_size if args.use_ddp else 1
     )
     val_dataset = COD10KDataset(
         root_dir=args.data_root,
         split='val',  # Use 'val' split (800 images) instead of 'test' (3200 images)
         img_size=args.img_size,
-        cache_in_memory=should_cache
+        cache_in_memory=True,
+        rank=args.rank if args.use_ddp else 0,
+        world_size=args.world_size if args.use_ddp else 1
     )
 
     if args.use_ddp:
