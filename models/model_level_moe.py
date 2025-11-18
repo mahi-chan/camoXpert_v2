@@ -114,24 +114,18 @@ class ModelLevelMoE(nn.Module):
         print("="*70)
 
     def _create_backbone(self, backbone_name, pretrained):
-        """Create backbone network"""
-        if 'pvt' in backbone_name:
-            from models.backbones.pvt_v2 import pvt_v2_b2, pvt_v2_b3, pvt_v2_b4, pvt_v2_b5
+        """Create backbone network using timm"""
+        import timm
 
-            backbone_dict = {
-                'pvt_v2_b2': pvt_v2_b2,
-                'pvt_v2_b3': pvt_v2_b3,
-                'pvt_v2_b4': pvt_v2_b4,
-                'pvt_v2_b5': pvt_v2_b5
-            }
-
-            if backbone_name in backbone_dict:
-                backbone = backbone_dict[backbone_name](pretrained=pretrained)
-            else:
-                raise ValueError(f"Unknown PVT backbone: {backbone_name}")
-
-        else:
-            raise ValueError(f"Unknown backbone: {backbone_name}")
+        try:
+            backbone = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                features_only=True,
+                out_indices=(0, 1, 2, 3)
+            )
+        except Exception as e:
+            raise ValueError(f"Failed to create backbone '{backbone_name}': {e}")
 
         return backbone
 
