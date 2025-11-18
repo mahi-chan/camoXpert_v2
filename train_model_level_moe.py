@@ -171,11 +171,12 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                       lr=args.lr, weight_decay=args.weight_decay)
 
-    # LR Scheduler: ReduceLROnPlateau - only reduce when IoU plateaus
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True, min_lr=args.lr * 0.1
+    # LR Scheduler: CosineAnnealingWarmRestarts - periodic LR restarts to escape local minima
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=args.lr * 0.01
     )
-    # Reduces LR by 0.5x if IoU doesn't improve for 5 epochs
+    # Restarts: Epoch 10, 30, 70 (cycles: 10, 20, 40+ epochs)
+    # Each restart: LR jumps back to initial value, helps escape plateaus
 
     # AMP: Mixed precision training for 2-3x speedup
     scaler = GradScaler()
@@ -298,8 +299,8 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                     'iou': best_iou
                 }, checkpoint_path)
 
-        # Step LR scheduler with validation IoU (ReduceLROnPlateau needs the metric)
-        scheduler.step(val_metrics['IoU'])
+        # Step LR scheduler (CosineAnnealingWarmRestarts steps every epoch)
+        scheduler.step()
 
         # Final cache clear before next epoch
         torch.cuda.empty_cache()
