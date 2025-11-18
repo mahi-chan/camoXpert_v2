@@ -119,7 +119,7 @@ class SINetExpert(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(feature_dims[-1], feature_dims[-1], 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 1),
+            nn.Conv2d(feature_dims[-1], 1, 1),  # Output single-channel attention
             nn.Sigmoid()
         )
 
@@ -153,7 +153,7 @@ class SINetExpert(nn.Module):
         # ============================================================
         # SEARCH STAGE: Generate attention map
         # ============================================================
-        search_attention = self.search_module(features[-1])  # [B, 512, 1, 1]
+        search_attention = self.search_module(features[-1])  # [B, 1, 1, 1]
 
         # ============================================================
         # IDENTIFICATION STAGE: Apply attention and refine
