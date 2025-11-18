@@ -212,6 +212,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
 
         avg_loss = total_loss / num_batches
 
+        # Clear CUDA cache to prevent OOM
+        torch.cuda.empty_cache()
+
         # Validation
         model.eval()
         val_metrics = {}
@@ -264,6 +267,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
 
         # Step LR scheduler
         scheduler.step()
+
+        # Final cache clear before next epoch
+        torch.cuda.empty_cache()
 
     if is_main_process(args):
         print(f"\nExpert {expert_id} training complete. Best IoU: {best_iou:.4f}")
