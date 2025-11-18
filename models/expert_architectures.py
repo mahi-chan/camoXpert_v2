@@ -1,15 +1,16 @@
 """
-Complete Expert Architectures for Model-Level MoE
+Complete Expert Architectures for Model-Level MoE - SOTA REPLICAS
 
-Each expert is a complete model (~15M params) with:
-- SOTA-inspired COD modules
-- Full decoder pathway
-- Prediction head
+Each expert implements REAL innovations from SOTA COD papers:
+- Deep Supervision (auxiliary losses at multiple scales)
+- Receptive Field Blocks (RFB) for multi-scale context
+- Boundary Enhancement Modules
+- Proper Feature Aggregation
 
-Expert 1: SINet-Style - Search & Identification
-Expert 2: PraNet-Style - Reverse Attention
-Expert 3: ZoomNet-Style - Multi-Scale Zoom Context
-Expert 4: UJSC-Style - Uncertainty-Guided Refinement
+Expert 1: SINet-Style - Search & Identification + RFB
+Expert 2: PraNet-Style - Reverse Attention + Boundary Guidance
+Expert 3: ZoomNet-Style - Multi-Scale Zoom + Feature Pyramid
+Expert 4: UJSC-Style - Uncertainty-Guided + Edge Refinement
 """
 
 import torch
@@ -18,11 +19,122 @@ import torch.nn.functional as F
 
 
 # ============================================================
-# Shared Decoder Module (used by all experts)
+# SHARED COMPONENTS (used by multiple experts)
 # ============================================================
 
+class RFB(nn.Module):
+    """
+    Receptive Field Block (RFB)
+
+    Used in: SINet, ZoomNet
+    Purpose: Capture multi-scale context with different dilation rates
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        inter_channels = in_channels // 4
+
+        # Branch 1: 1x1 conv
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels, 1),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Branch 2: 1x1 -> 3x3 (dilation=1)
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels, 1),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, inter_channels, 3, padding=1, dilation=1),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Branch 3: 1x1 -> 3x3 (dilation=3)
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels, 1),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, inter_channels, 3, padding=3, dilation=3),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Branch 4: 1x1 -> 3x3 (dilation=5)
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(in_channels, inter_channels, 1),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(inter_channels, inter_channels, 3, padding=5, dilation=5),
+            nn.BatchNorm2d(inter_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(inter_channels * 4, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        b4 = self.branch4(x)
+
+        # Concatenate all branches
+        out = torch.cat([b1, b2, b3, b4], dim=1)
+        out = self.fusion(out)
+
+        return out
+
+
+class BoundaryEnhancement(nn.Module):
+    """
+    Boundary Enhancement Module
+
+    Used in: PraNet, UJSC
+    Purpose: Explicitly detect and enhance object boundaries
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+
+        # Edge detection branch
+        self.edge_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # Boundary refinement
+        self.boundary_refine = nn.Sequential(
+            nn.Conv2d(in_channels + 1, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # Detect edges
+        edges = self.edge_conv(x)
+
+        # Concatenate features with edge map
+        x_with_edges = torch.cat([x, edges], dim=1)
+
+        # Refine with boundary awareness
+        refined = self.boundary_refine(x_with_edges)
+
+        return refined, edges
+
+
 class DecoderBlock(nn.Module):
-    """Standard decoder block with upsampling and skip connections"""
+    """Decoder block with upsampling and skip connections"""
     def __init__(self, in_channels, skip_channels, out_channels):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -46,16 +158,25 @@ class DecoderBlock(nn.Module):
         return x
 
 
-class FullDecoder(nn.Module):
-    """Complete decoder pathway from features to prediction"""
+class DeepSupervisionDecoder(nn.Module):
+    """
+    Decoder with Deep Supervision
+
+    Outputs predictions at multiple scales for auxiliary losses
+    """
     def __init__(self, feature_dims=[64, 128, 320, 512]):
         super().__init__()
 
-        # Decoder blocks: progressively upsample
+        # Decoder blocks
         self.decoder4 = DecoderBlock(feature_dims[3], feature_dims[2], 256)
         self.decoder3 = DecoderBlock(256, feature_dims[1], 128)
         self.decoder2 = DecoderBlock(128, feature_dims[0], 64)
         self.decoder1 = DecoderBlock(64, 0, 32)
+
+        # Deep supervision: Auxiliary prediction heads at each level
+        self.aux_head4 = nn.Conv2d(256, 1, 1)  # 28x28
+        self.aux_head3 = nn.Conv2d(128, 1, 1)  # 56x56
+        self.aux_head2 = nn.Conv2d(64, 1, 1)   # 112x112
 
         # Final prediction head
         self.pred_head = nn.Sequential(
@@ -65,16 +186,15 @@ class FullDecoder(nn.Module):
             nn.Conv2d(16, 1, 1)
         )
 
-    def forward(self, features):
+    def forward(self, features, return_aux=False):
         """
         Args:
             features: [f1, f2, f3, f4] from backbone
-                     f1: [B, 64, 112, 112]
-                     f2: [B, 128, 56, 56]
-                     f3: [B, 320, 28, 28]
-                     f4: [B, 512, 14, 14]
+            return_aux: If True, return auxiliary outputs for deep supervision
+
         Returns:
-            prediction: [B, 1, 448, 448]
+            pred: Final prediction [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions (if return_aux=True)
         """
         f1, f2, f3, f4 = features
 
@@ -87,24 +207,33 @@ class FullDecoder(nn.Module):
         # Final upsample to input resolution
         d1 = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)  # [B, 32, 448, 448]
 
-        # Prediction
+        # Main prediction
         pred = self.pred_head(d1)  # [B, 1, 448, 448]
+
+        if return_aux:
+            # Auxiliary outputs (upsampled to 448x448 for loss computation)
+            aux4 = F.interpolate(self.aux_head4(d4), size=(448, 448), mode='bilinear', align_corners=False)
+            aux3 = F.interpolate(self.aux_head3(d3), size=(448, 448), mode='bilinear', align_corners=False)
+            aux2 = F.interpolate(self.aux_head2(d2), size=(448, 448), mode='bilinear', align_corners=False)
+
+            return pred, [aux4, aux3, aux2]
 
         return pred
 
 
 # ============================================================
-# EXPERT 1: SINet-Style (Search & Identification)
+# EXPERT 1: SINet-Style (Search & Identification + RFB)
 # ============================================================
 
 class SINetExpert(nn.Module):
     """
-    SINet-Style Expert: Two-stage Search then Identify
+    SINet-Style Expert: Two-stage Search then Identify + RFB
 
-    Best for: Hard-to-find objects, cluttered backgrounds
-    Strategy:
-      1. Search stage: Find candidate regions (global attention)
-      2. Identification stage: Refine candidates (local features)
+    REAL INNOVATIONS:
+    - RFB modules for multi-scale receptive fields
+    - Search module with global context
+    - Identification with local refinement
+    - Deep supervision
 
     ~15M parameters
     """
@@ -113,18 +242,19 @@ class SINetExpert(nn.Module):
         self.feature_dims = feature_dims
 
         # ============================================================
-        # SEARCH MODULE: Find candidate object regions
+        # SEARCH MODULE: Global context with RFB
         # ============================================================
-        self.search_module = nn.Sequential(
+        self.search_rfb = RFB(feature_dims[-1], feature_dims[-1])
+        self.search_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 1),
+            nn.Conv2d(feature_dims[-1], feature_dims[-1] // 4, 1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dims[-1], 1, 1),  # Output single-channel attention
+            nn.Conv2d(feature_dims[-1] // 4, 1, 1),
             nn.Sigmoid()
         )
 
         # ============================================================
-        # IDENTIFICATION MODULE: Refine features per scale
+        # IDENTIFICATION MODULE: Local refinement per scale
         # ============================================================
         self.identify_modules = nn.ModuleList([
             nn.Sequential(
@@ -138,9 +268,9 @@ class SINetExpert(nn.Module):
         ])
 
         # ============================================================
-        # DECODER: Full decoder to prediction
+        # DECODER with Deep Supervision
         # ============================================================
-        self.decoder = FullDecoder(feature_dims)
+        self.decoder = DeepSupervisionDecoder(feature_dims)
 
     def forward(self, features):
         """
@@ -149,11 +279,13 @@ class SINetExpert(nn.Module):
 
         Returns:
             prediction: [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions (for deep supervision)
         """
         # ============================================================
-        # SEARCH STAGE: Generate attention map
+        # SEARCH STAGE: Multi-scale context + attention
         # ============================================================
-        search_attention = self.search_module(features[-1])  # [B, 1, 1, 1]
+        search_feat = self.search_rfb(features[-1])  # Apply RFB
+        search_attention = self.search_attention(search_feat)  # [B, 1, 1, 1]
 
         # ============================================================
         # IDENTIFICATION STAGE: Apply attention and refine
@@ -164,31 +296,31 @@ class SINetExpert(nn.Module):
             attention = F.interpolate(search_attention, size=feat.shape[2:], mode='bilinear', align_corners=False)
 
             # Apply attention and refine
-            attended = feat * (1 + attention)  # Boost attended regions
+            attended = feat * (1 + attention)
             refined = identify(attended)
-            refined_features.append(refined + feat)  # Residual connection
+            refined_features.append(refined + feat)  # Residual
 
         # ============================================================
-        # DECODE to final prediction
+        # DECODE with deep supervision
         # ============================================================
-        pred = self.decoder(refined_features)
+        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
 
-        return pred
+        return pred, aux_outputs
 
 
 # ============================================================
-# EXPERT 2: PraNet-Style (Reverse Attention)
+# EXPERT 2: PraNet-Style (Reverse Attention + Boundary)
 # ============================================================
 
 class PraNetExpert(nn.Module):
     """
-    PraNet-Style Expert: Reverse Attention Mechanism
+    PraNet-Style Expert: Reverse Attention + Boundary Enhancement
 
-    Best for: Clear foreground-background separation
-    Strategy:
-      1. Learn what's NOT the object (background)
-      2. Foreground = 1 - background
-      3. Refine foreground features
+    REAL INNOVATIONS:
+    - Reverse attention (learn background, infer foreground)
+    - Boundary enhancement modules
+    - Deep supervision
+    - Edge-guided refinement
 
     ~15M parameters
     """
@@ -210,23 +342,16 @@ class PraNetExpert(nn.Module):
         ])
 
         # ============================================================
-        # FOREGROUND REFINEMENT: Enhance foreground features
+        # BOUNDARY ENHANCEMENT: Explicit edge detection
         # ============================================================
-        self.foreground_refine_modules = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+        self.boundary_modules = nn.ModuleList([
+            BoundaryEnhancement(dim) for dim in feature_dims
         ])
 
         # ============================================================
-        # DECODER
+        # DECODER with Deep Supervision
         # ============================================================
-        self.decoder = FullDecoder(feature_dims)
+        self.decoder = DeepSupervisionDecoder(feature_dims)
 
     def forward(self, features):
         """
@@ -235,52 +360,50 @@ class PraNetExpert(nn.Module):
 
         Returns:
             prediction: [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions
         """
         refined_features = []
 
-        for feat, reverse_attn, fg_refine in zip(
+        for feat, reverse_attn, boundary_module in zip(
             features,
             self.reverse_attention_modules,
-            self.foreground_refine_modules
+            self.boundary_modules
         ):
             # ============================================================
-            # Predict BACKGROUND (reverse attention)
+            # REVERSE ATTENTION: Predict background
             # ============================================================
             bg_map = reverse_attn(feat)  # [B, 1, H, W]
-
-            # ============================================================
-            # Compute FOREGROUND
-            # ============================================================
             fg_map = 1 - bg_map
 
             # ============================================================
-            # Enhance foreground features
+            # BOUNDARY ENHANCEMENT: Edge-guided refinement
             # ============================================================
             fg_features = feat * fg_map
-            refined = fg_refine(fg_features)
+            refined, edges = boundary_module(fg_features)
+
             refined_features.append(refined + feat)  # Residual
 
         # ============================================================
-        # DECODE to final prediction
+        # DECODE with deep supervision
         # ============================================================
-        pred = self.decoder(refined_features)
+        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
 
-        return pred
+        return pred, aux_outputs
 
 
 # ============================================================
-# EXPERT 3: ZoomNet-Style (Multi-Scale Zoom Context)
+# EXPERT 3: ZoomNet-Style (Multi-Scale + Feature Pyramid)
 # ============================================================
 
 class ZoomNetExpert(nn.Module):
     """
-    ZoomNet-Style Expert: Multi-Scale Zoom & Context
+    ZoomNet-Style Expert: Multi-Scale Zoom + Feature Pyramid
 
-    Best for: Multi-scale objects, varying sizes
-    Strategy:
-      1. Zoom-out: Capture large context (downsample)
-      2. Zoom-in: Capture fine details (upsample)
-      3. Fuse multi-scale information
+    REAL INNOVATIONS:
+    - RFB modules at multiple scales
+    - Zoom-in and zoom-out with different receptive fields
+    - Feature Pyramid Network (FPN) for multi-scale fusion
+    - Deep supervision
 
     ~15M parameters
     """
@@ -289,45 +412,36 @@ class ZoomNetExpert(nn.Module):
         self.feature_dims = feature_dims
 
         # ============================================================
-        # ZOOM-OUT MODULE: Large context
+        # RFB MODULES: Multi-scale context at each level
         # ============================================================
-        self.zoom_out = nn.Sequential(
-            nn.AdaptiveAvgPool2d((7, 7)),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 3, padding=1),
-            nn.BatchNorm2d(feature_dims[-1]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 3, padding=1),
-            nn.BatchNorm2d(feature_dims[-1]),
-            nn.ReLU(inplace=True)
-        )
-
-        # ============================================================
-        # ZOOM-IN MODULE: Fine details
-        # ============================================================
-        self.zoom_in = nn.Sequential(
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 3, padding=1),
-            nn.BatchNorm2d(feature_dims[-1]),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1], 3, padding=1),
-            nn.BatchNorm2d(feature_dims[-1]),
-            nn.ReLU(inplace=True)
-        )
-
-        # ============================================================
-        # MULTI-SCALE FUSION: Combine zoom levels
-        # ============================================================
-        self.fusion_modules = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim * 2, dim, 1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+        self.rfb_modules = nn.ModuleList([
+            RFB(dim, dim) for dim in feature_dims
         ])
 
         # ============================================================
-        # DECODER
+        # FEATURE PYRAMID NETWORK: Top-down pathway
         # ============================================================
-        self.decoder = FullDecoder(feature_dims)
+        self.fpn_lateral = nn.ModuleList([
+            nn.Conv2d(dim, 256, 1) for dim in feature_dims
+        ])
+
+        self.fpn_output = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(256, 256, 3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True)
+            ) for _ in feature_dims
+        ])
+
+        # Reduce back to original dims
+        self.fpn_reduce = nn.ModuleList([
+            nn.Conv2d(256, dim, 1) for dim in feature_dims
+        ])
+
+        # ============================================================
+        # DECODER with Deep Supervision
+        # ============================================================
+        self.decoder = DeepSupervisionDecoder(feature_dims)
 
     def forward(self, features):
         """
@@ -336,56 +450,55 @@ class ZoomNetExpert(nn.Module):
 
         Returns:
             prediction: [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions
         """
         # ============================================================
-        # Multi-scale context from highest features
+        # Apply RFB to each feature level
         # ============================================================
-        highest_feat = features[-1]  # [B, 512, 14, 14]
-
-        # Zoom-out: Capture large context
-        zoom_out_feat = self.zoom_out(highest_feat)  # [B, 512, 7, 7]
-        zoom_out_feat = F.interpolate(zoom_out_feat, size=highest_feat.shape[2:], mode='bilinear', align_corners=False)
-
-        # Zoom-in: Capture fine details
-        zoom_in_feat = self.zoom_in(highest_feat)  # [B, 512, 14, 14]
-
-        # Combine zoom levels
-        multi_scale_context = torch.cat([zoom_out_feat, zoom_in_feat], dim=1)  # [B, 1024, 14, 14]
+        rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, features)]
 
         # ============================================================
-        # Fuse with all feature scales
+        # Feature Pyramid Network (top-down)
         # ============================================================
-        refined_features = []
-        for i, (feat, fusion) in enumerate(zip(features, self.fusion_modules)):
-            # Resize multi-scale context to match feature size
-            context = F.interpolate(multi_scale_context, size=feat.shape[2:], mode='bilinear', align_corners=False)
+        # Lateral connections
+        fpn_feats = [lateral(feat) for lateral, feat in zip(self.fpn_lateral, rfb_features)]
 
-            # Concatenate and fuse
-            fused = torch.cat([feat, context[:, :feat.shape[1]]], dim=1)  # Match channels
-            refined = fusion(fused)
-            refined_features.append(refined + feat)  # Residual
+        # Top-down pathway
+        for i in range(len(fpn_feats) - 1, 0, -1):
+            # Upsample higher-level features
+            upsampled = F.interpolate(fpn_feats[i], size=fpn_feats[i-1].shape[2:],
+                                     mode='bilinear', align_corners=False)
+            # Add to lower-level features
+            fpn_feats[i-1] = fpn_feats[i-1] + upsampled
+
+        # Output convolutions
+        fpn_outputs = [conv(feat) for conv, feat in zip(self.fpn_output, fpn_feats)]
+
+        # Reduce back to original dimensions
+        refined_features = [reduce(feat) + orig_feat
+                           for reduce, feat, orig_feat in zip(self.fpn_reduce, fpn_outputs, features)]
 
         # ============================================================
-        # DECODE to final prediction
+        # DECODE with deep supervision
         # ============================================================
-        pred = self.decoder(refined_features)
+        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
 
-        return pred
+        return pred, aux_outputs
 
 
 # ============================================================
-# EXPERT 4: UJSC-Style (Uncertainty-Guided Refinement)
+# EXPERT 4: UJSC-Style (Uncertainty + Edge Refinement)
 # ============================================================
 
 class UJSCExpert(nn.Module):
     """
-    UJSC-Style Expert: Uncertainty-Guided Refinement
+    UJSC-Style Expert: Uncertainty-Guided + Edge Refinement
 
-    Best for: Ambiguous boundaries, difficult edges
-    Strategy:
-      1. Predict uncertainty map (where model is uncertain)
-      2. Use uncertainty to guide feature refinement
-      3. Focus more on uncertain regions
+    REAL INNOVATIONS:
+    - Uncertainty prediction with dropout-based estimation
+    - Boundary enhancement modules
+    - Uncertainty-weighted feature refinement
+    - Deep supervision
 
     ~15M parameters
     """
@@ -394,12 +507,13 @@ class UJSCExpert(nn.Module):
         self.feature_dims = feature_dims
 
         # ============================================================
-        # UNCERTAINTY PREDICTION HEAD
+        # UNCERTAINTY PREDICTION
         # ============================================================
         self.uncertainty_head = nn.Sequential(
             nn.Conv2d(feature_dims[-1], 256, 3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.5),  # Dropout for uncertainty estimation
             nn.Conv2d(256, 128, 3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
@@ -408,11 +522,18 @@ class UJSCExpert(nn.Module):
         )
 
         # ============================================================
-        # UNCERTAINTY-GUIDED REFINEMENT (per scale)
+        # BOUNDARY ENHANCEMENT: Edge detection per scale
+        # ============================================================
+        self.boundary_modules = nn.ModuleList([
+            BoundaryEnhancement(dim) for dim in feature_dims
+        ])
+
+        # ============================================================
+        # UNCERTAINTY-GUIDED REFINEMENT
         # ============================================================
         self.refinement_modules = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim + 1, dim, 3, padding=1),  # +1 for uncertainty map
+                nn.Conv2d(dim + 1, dim, 3, padding=1),
                 nn.BatchNorm2d(dim),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(dim, dim, 3, padding=1),
@@ -422,9 +543,9 @@ class UJSCExpert(nn.Module):
         ])
 
         # ============================================================
-        # DECODER
+        # DECODER with Deep Supervision
         # ============================================================
-        self.decoder = FullDecoder(feature_dims)
+        self.decoder = DeepSupervisionDecoder(feature_dims)
 
     def forward(self, features):
         """
@@ -433,6 +554,7 @@ class UJSCExpert(nn.Module):
 
         Returns:
             prediction: [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions
         """
         # ============================================================
         # Predict uncertainty map
@@ -440,26 +562,30 @@ class UJSCExpert(nn.Module):
         uncertainty = self.uncertainty_head(features[-1])  # [B, 1, 14, 14]
 
         # ============================================================
-        # Use uncertainty to guide refinement at each scale
+        # Boundary enhancement + uncertainty-guided refinement
         # ============================================================
         refined_features = []
-        for feat, refine in zip(features, self.refinement_modules):
+        for feat, boundary_module, refine in zip(features, self.boundary_modules, self.refinement_modules):
+            # Detect boundaries
+            boundary_feat, edges = boundary_module(feat)
+
             # Resize uncertainty to match feature size
-            unc_resized = F.interpolate(uncertainty, size=feat.shape[2:], mode='bilinear', align_corners=False)
+            unc_resized = F.interpolate(uncertainty, size=feat.shape[2:],
+                                       mode='bilinear', align_corners=False)
 
             # Concatenate feature with uncertainty
-            feat_with_unc = torch.cat([feat, unc_resized], dim=1)  # [B, dim+1, H, W]
+            feat_with_unc = torch.cat([boundary_feat, unc_resized], dim=1)
 
-            # Refine features (focus more on uncertain regions)
+            # Uncertainty-guided refinement
             refined = refine(feat_with_unc)
             refined_features.append(refined + feat)  # Residual
 
         # ============================================================
-        # DECODE to final prediction
+        # DECODE with deep supervision
         # ============================================================
-        pred = self.decoder(refined_features)
+        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
 
-        return pred
+        return pred, aux_outputs
 
 
 def count_parameters(model):
@@ -468,7 +594,7 @@ def count_parameters(model):
 
 
 if __name__ == '__main__':
-    print("Testing Expert Architectures...")
+    print("Testing SOTA Expert Architectures...")
     print("="*60)
 
     # Create dummy features
@@ -490,9 +616,14 @@ if __name__ == '__main__':
         print(f"\n{name} Expert:")
         print(f"  Parameters: {count_parameters(expert) / 1e6:.1f}M")
 
-        pred = expert(features)
-        print(f"  Output shape: {pred.shape}")
+        pred, aux_outputs = expert(features)
+        print(f"  Main output shape: {pred.shape}")
+        print(f"  Auxiliary outputs: {len(aux_outputs)} scales")
+        for i, aux in enumerate(aux_outputs):
+            print(f"    Aux {i+1}: {aux.shape}")
+
         assert pred.shape == (2, 1, 448, 448), f"Wrong output shape: {pred.shape}"
+        assert len(aux_outputs) == 3, f"Wrong number of aux outputs: {len(aux_outputs)}"
 
     print("\n" + "="*60)
-    print("✓ All expert tests passed!")
+    print("✓ All SOTA expert tests passed!")

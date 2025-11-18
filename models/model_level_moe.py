@@ -179,7 +179,7 @@ class ModelLevelMoE(nn.Module):
             # During training or when using all experts: run all and combine
             expert_predictions = []
             for expert in self.expert_models:
-                pred = expert(features)  # [B, 1, H, W]
+                pred, _ = expert(features)  # [B, 1, H, W] (ignore aux outputs for ensemble)
                 expert_predictions.append(pred)
 
             expert_predictions = torch.stack(expert_predictions, dim=1)  # [B, num_experts, 1, H, W]
@@ -200,9 +200,9 @@ class ModelLevelMoE(nn.Module):
                     weight = top_k_weights[b, k]
 
                     # Run only this expert
-                    pred = self.expert_models[expert_idx](
+                    pred, _ = self.expert_models[expert_idx](
                         [f[b:b+1] for f in features]
-                    )  # [1, 1, H, W]
+                    )  # [1, 1, H, W] (ignore aux outputs)
 
                     final_prediction[b] += weight * pred.squeeze(0)
 

@@ -197,11 +197,23 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             images = images.cuda()
             masks = masks.cuda()
 
-            # Forward with AMP (mixed precision)
+            # Forward with AMP (mixed precision) + Deep Supervision
             with autocast():
                 features = actual_model.backbone(images)
-                pred = actual_model.expert_models[expert_id](features)
-                loss, _ = criterion(pred, masks)
+                pred, aux_outputs = actual_model.expert_models[expert_id](features)
+
+                # Main loss
+                main_loss, _ = criterion(pred, masks)
+
+                # Deep supervision: auxiliary losses at multiple scales
+                aux_loss = 0
+                for aux_pred in aux_outputs:
+                    aux_l, _ = criterion(aux_pred, masks)
+                    aux_loss += aux_l
+                aux_loss = aux_loss / len(aux_outputs) if aux_outputs else 0
+
+                # Total loss: main + 0.4 * auxiliary
+                loss = main_loss + 0.4 * aux_loss
                 loss = loss / args.accumulation_steps
 
             # Backward (accumulate gradients) with scaled gradients
@@ -247,7 +259,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
 
                 with autocast():
                     features = actual_model.backbone(images)
-                    pred = actual_model.expert_models[expert_id](features)
+                    pred, _ = actual_model.expert_models[expert_id](features)  # Ignore aux outputs in validation
                     pred = torch.sigmoid(pred)
 
                 if is_main_process(args):
