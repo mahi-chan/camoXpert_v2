@@ -467,12 +467,22 @@ def main():
     )
 
     # Model
+    target_device = args.local_rank if args.use_ddp else 0
+    if is_main_process(args) or args.use_ddp:
+        print(f"[Rank {args.rank}] Creating model on cuda:{target_device}")
+
     model = ModelLevelMoE(
         backbone=args.backbone,
         num_experts=args.num_experts,
         top_k=args.top_k,
         pretrained=True
-    ).cuda(args.local_rank if args.use_ddp else 0)
+    ).cuda(target_device)
+
+    if is_main_process(args) or args.use_ddp:
+        print(f"[Rank {args.rank}] Model created, checking device...")
+        # Verify model is on correct device
+        first_param_device = next(model.parameters()).device
+        print(f"[Rank {args.rank}] Model parameters are on: {first_param_device}")
 
     # Load checkpoints if specified
     device = f'cuda:{args.local_rank if args.use_ddp else 0}'
@@ -490,7 +500,9 @@ def main():
 
     # DDP
     if args.use_ddp:
+        print(f"[Rank {args.rank}] Wrapping model with DDP on device_ids=[{args.local_rank}]")
         model = DDP(model, device_ids=[args.local_rank], find_unused_parameters=True)
+        print(f"[Rank {args.rank}] DDP wrapping successful")
 
     # Loss and metrics
     criterion = CODSpecializedLoss(
