@@ -510,16 +510,16 @@ def main():
         split='train',
         img_size=args.img_size,
         cache_in_memory=True,
-        rank=0,  # Cache all images - DistributedSampler handles splitting
-        world_size=1
+        rank=args.rank if args.use_ddp else 0,
+        world_size=args.world_size if args.use_ddp else 1
     )
     val_dataset = COD10KDataset(
         root_dir=args.data_root,
-        split='val',  # Use 'val' split (800 images) instead of 'test' (3200 images)
+        split='val',
         img_size=args.img_size,
         cache_in_memory=True,
-        rank=0,  # Cache all images - DistributedSampler handles splitting
-        world_size=1
+        rank=args.rank if args.use_ddp else 0,
+        world_size=args.world_size if args.use_ddp else 1
     )
 
     if args.use_ddp:
