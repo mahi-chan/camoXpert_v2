@@ -71,6 +71,23 @@ def parse_args():
     parser.add_argument('--accumulation-steps', type=int, default=1,
                         help='Gradient accumulation steps (effective_batch = batch_size * accumulation_steps)')
 
+    # LR Scheduler Configuration
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        choices=['cosine', 'warmrestarts', 'plateau', 'step', 'none'],
+                        help='LR scheduler type: cosine (smooth decay), warmrestarts (periodic), plateau (adaptive), step (milestones), none (constant)')
+    parser.add_argument('--scheduler-t0', type=int, default=20,
+                        help='For warmrestarts: initial restart period (epochs)')
+    parser.add_argument('--scheduler-tmult', type=int, default=1,
+                        help='For warmrestarts: cycle length multiplier (1=same length, 2=doubling)')
+    parser.add_argument('--scheduler-patience', type=int, default=5,
+                        help='For plateau: epochs to wait before reducing LR')
+    parser.add_argument('--scheduler-factor', type=float, default=0.5,
+                        help='For plateau/step: LR reduction factor')
+    parser.add_argument('--scheduler-min-lr', type=float, default=0.01,
+                        help='Minimum LR as ratio of initial LR (e.g., 0.01 = 1%%)')
+    parser.add_argument('--scheduler-milestones', type=int, nargs='+', default=[30, 45],
+                        help='For step: epochs to reduce LR')
+
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints_moe')
     parser.add_argument('--resume-from', type=str, default=None)
@@ -116,6 +133,54 @@ def get_model(model):
     return model.module if hasattr(model, 'module') else model
 
 
+def create_scheduler(optimizer, args):
+    """
+    Create LR scheduler based on args
+
+    Returns:
+        scheduler: LR scheduler instance
+        needs_metric: Whether scheduler.step() needs validation metric
+    """
+    min_lr = args.lr * args.scheduler_min_lr
+
+    if args.scheduler == 'cosine':
+        # Simple cosine decay - SMOOTH & STABLE (recommended for most cases)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=min_lr
+        )
+        return scheduler, False
+
+    elif args.scheduler == 'warmrestarts':
+        # Cosine with periodic restarts - can escape local minima but may be unstable
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=args.scheduler_t0, T_mult=args.scheduler_tmult, eta_min=min_lr
+        )
+        return scheduler, False
+
+    elif args.scheduler == 'plateau':
+        # Reduce LR when metric plateaus - adaptive but reactive
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=args.scheduler_factor,
+            patience=args.scheduler_patience, verbose=True, min_lr=min_lr
+        )
+        return scheduler, True
+
+    elif args.scheduler == 'step':
+        # Step decay at milestones - simple but needs manual tuning
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=args.scheduler_milestones, gamma=args.scheduler_factor
+        )
+        return scheduler, False
+
+    elif args.scheduler == 'none':
+        # Constant LR - no scheduling
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda epoch: 1.0)
+        return scheduler, False
+
+    else:
+        raise ValueError(f"Unknown scheduler: {args.scheduler}")
+
+
 def print_stage_info(stage, args):
     """Print information about current training stage"""
     if not is_main_process(args):
@@ -131,17 +196,20 @@ def print_stage_info(stage, args):
             print("STAGE 1: TRAINING ALL EXPERTS SEQUENTIALLY")
         print(f"  Epochs: {args.epochs}")
         print(f"  LR: {args.lr}")
+        print(f"  Scheduler: {args.scheduler}")
         print(f"  Goal: Each expert reaches 0.73-0.76 IoU")
     elif stage == 2:
         print("STAGE 2: TRAINING ROUTER")
         print(f"  Epochs: {args.epochs}")
         print(f"  LR: {args.lr}")
+        print(f"  Scheduler: {args.scheduler}")
         print(f"  Experts: FROZEN")
         print(f"  Goal: Learn optimal expert selection")
     elif stage == 3:
         print("STAGE 3: FINE-TUNING FULL ENSEMBLE")
         print(f"  Epochs: {args.epochs}")
         print(f"  LR: {args.lr}")
+        print(f"  Scheduler: {args.scheduler}")
         print(f"  All parameters: TRAINABLE")
         print(f"  Goal: Ensemble reaches 0.80-0.81 IoU")
     print("="*70 + "\n")
@@ -171,12 +239,18 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                       lr=args.lr, weight_decay=args.weight_decay)
 
-    # LR Scheduler: CosineAnnealingWarmRestarts - periodic LR restarts to escape local minima
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=args.lr * 0.01
-    )
-    # Restarts: Epoch 10, 30, 70 (cycles: 10, 20, 40+ epochs)
-    # Each restart: LR jumps back to initial value, helps escape plateaus
+    # LR Scheduler (configurable via --scheduler flag)
+    scheduler, scheduler_needs_metric = create_scheduler(optimizer, args)
+
+    if is_main_process(args):
+        sched_info = {
+            'cosine': f"Cosine decay: {args.lr:.6f} → {args.lr * args.scheduler_min_lr:.6f} over {args.epochs} epochs",
+            'warmrestarts': f"Warm restarts: T_0={args.scheduler_t0}, T_mult={args.scheduler_tmult}, min_lr={args.lr * args.scheduler_min_lr:.6f}",
+            'plateau': f"Reduce on plateau: patience={args.scheduler_patience}, factor={args.scheduler_factor}, min_lr={args.lr * args.scheduler_min_lr:.6f}",
+            'step': f"Step decay: milestones={args.scheduler_milestones}, factor={args.scheduler_factor}",
+            'none': f"Constant LR: {args.lr:.6f}"
+        }
+        print(f"Scheduler: {sched_info.get(args.scheduler, args.scheduler)}")
 
     # AMP: Mixed precision training for 2-3x speedup
     scaler = GradScaler()
@@ -299,8 +373,13 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                     'iou': best_iou
                 }, checkpoint_path)
 
-        # Step LR scheduler (CosineAnnealingWarmRestarts steps every epoch)
-        scheduler.step()
+        # Step LR scheduler
+        if scheduler_needs_metric:
+            # ReduceLROnPlateau needs the validation metric
+            scheduler.step(val_metrics['IoU'])
+        else:
+            # Other schedulers step based on epoch
+            scheduler.step()
 
         # Final cache clear before next epoch
         torch.cuda.empty_cache()
@@ -328,6 +407,9 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
     # Optimizer
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                       lr=args.lr, weight_decay=args.weight_decay)
+
+    # LR Scheduler
+    scheduler, scheduler_needs_metric = create_scheduler(optimizer, args)
 
     # Training loop
     best_iou = 0.0
@@ -413,6 +495,12 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
                     'iou': best_iou
                 }, checkpoint_path)
 
+        # Step LR scheduler
+        if scheduler_needs_metric:
+            scheduler.step(val_metrics['IoU'])
+        else:
+            scheduler.step()
+
     if is_main_process(args):
         print(f"\nRouter training complete. Best IoU: {best_iou:.4f}")
 
@@ -439,10 +527,8 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
         {'params': actual_model.expert_models.parameters(), 'lr': args.lr * 0.5}  # Medium LR for experts
     ], weight_decay=args.weight_decay)
 
-    # Cosine scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=1e-6
-    )
+    # LR Scheduler
+    scheduler, scheduler_needs_metric = create_scheduler(optimizer, args)
 
     # Training loop
     best_iou = 0.0
@@ -480,7 +566,6 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
                 pbar.set_postfix({'loss': f'{loss.item() * args.accumulation_steps:.4f}'})
 
         avg_loss = total_loss / num_batches
-        scheduler.step()
 
         # Validation
         model.eval()
@@ -518,6 +603,12 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iou': best_iou
                 }, checkpoint_path)
+
+        # Step LR scheduler
+        if scheduler_needs_metric:
+            scheduler.step(val_metrics['IoU'])
+        else:
+            scheduler.step()
 
     if is_main_process(args):
         print(f"\nEnsemble training complete. Best IoU: {best_iou:.4f}")
