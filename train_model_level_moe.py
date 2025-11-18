@@ -32,6 +32,7 @@ from torch.optim import AdamW
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from models.model_level_moe import ModelLevelMoE, count_parameters
 from data.dataset import COD10KDataset
@@ -179,13 +180,13 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         total_loss = 0
         num_batches = 0
 
+        # Wrap dataloader with tqdm progress bar (only on main process)
         if is_main_process(args):
-            print(f"\n[Epoch {epoch+1}/{args.epochs}] Training Expert {expert_id}...")
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Expert {expert_id}]")
+        else:
+            pbar = train_loader
 
-        for batch_idx, (images, masks) in enumerate(train_loader):
-            if is_main_process(args) and batch_idx == 0:
-                print(f"  First batch loading (CUDA compile + heavy augmentation = 30-60s)...", flush=True)
-
+        for images, masks in pbar:
             images = images.cuda()
             masks = masks.cuda()
 
@@ -204,9 +205,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             total_loss += loss.item()
             num_batches += 1
 
-            # Progress indicator every 50 batches
-            if is_main_process(args) and (batch_idx + 1) % 50 == 0:
-                print(f"  Batch {batch_idx + 1}/{len(train_loader)} | Loss: {loss.item():.4f}", flush=True)
+            # Update progress bar with current loss
+            if is_main_process(args):
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
         avg_loss = total_loss / num_batches
 
@@ -214,7 +215,8 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         model.eval()
         val_metrics = {}
         with torch.no_grad():
-            for images, masks in val_loader:
+            val_pbar = tqdm(val_loader, desc="Validating", leave=False) if is_main_process(args) else val_loader
+            for images, masks in val_pbar:
                 images = images.cuda()
                 masks = masks.cuda()
 
@@ -280,7 +282,9 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
         total_loss = 0
         num_batches = 0
 
-        for images, masks in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Router]") if is_main_process(args) else train_loader
+
+        for images, masks in pbar:
             images = images.cuda()
             masks = masks.cuda()
 
@@ -312,12 +316,16 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
             total_loss += loss.item()
             num_batches += 1
 
+            if is_main_process(args):
+                pbar.set_postfix({'seg_loss': f'{seg_loss.item():.4f}', 'div_loss': f'{diversity_loss.item():.4f}'})
+
         avg_loss = total_loss / num_batches
 
         # Validation
         model.eval()
         with torch.no_grad():
-            for images, masks in val_loader:
+            val_pbar = tqdm(val_loader, desc="Validating", leave=False) if is_main_process(args) else val_loader
+            for images, masks in val_pbar:
                 images = images.cuda()
                 masks = masks.cuda()
 
@@ -386,7 +394,9 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
         total_loss = 0
         num_batches = 0
 
-        for images, masks in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Full Ensemble]") if is_main_process(args) else train_loader
+
+        for images, masks in pbar:
             images = images.cuda()
             masks = masks.cuda()
 
@@ -405,13 +415,17 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
             total_loss += loss.item()
             num_batches += 1
 
+            if is_main_process(args):
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
         avg_loss = total_loss / num_batches
         scheduler.step()
 
         # Validation
         model.eval()
         with torch.no_grad():
-            for images, masks in val_loader:
+            val_pbar = tqdm(val_loader, desc="Validating", leave=False) if is_main_process(args) else val_loader
+            for images, masks in val_pbar:
                 images = images.cuda()
                 masks = masks.cuda()
 
