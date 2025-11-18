@@ -3,6 +3,32 @@ import numpy as np
 
 
 class CODMetrics:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset accumulated metrics"""
+        self.total_metrics = {}
+        self.num_batches = 0
+
+    def update(self, pred, target, threshold=0.5):
+        """Accumulate metrics from a batch"""
+        batch_metrics = self.compute_all(pred, target, threshold)
+
+        if self.num_batches == 0:
+            self.total_metrics = {k: v for k, v in batch_metrics.items()}
+        else:
+            for k, v in batch_metrics.items():
+                self.total_metrics[k] += v
+
+        self.num_batches += 1
+
+    def compute(self):
+        """Compute average metrics across all batches"""
+        if self.num_batches == 0:
+            return {}
+        return {k: v / self.num_batches for k, v in self.total_metrics.items()}
+
     @torch.no_grad()
     def pixel_accuracy(self, pred, target, threshold=0.5):
         """Calculate pixel-wise accuracy"""
