@@ -32,6 +32,7 @@ from torch.optim import AdamW
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 from models.model_level_moe import ModelLevelMoE, count_parameters
@@ -175,6 +176,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
     )
 
+    # AMP: Mixed precision training for 2-3x speedup
+    scaler = GradScaler()
+
     # Training loop
     best_iou = 0.0
     for epoch in range(args.epochs):
@@ -192,21 +196,22 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             images = images.cuda()
             masks = masks.cuda()
 
-            # Forward: only this expert produces prediction
-            features = actual_model.backbone(images)
-            pred = actual_model.expert_models[expert_id](features)
+            # Forward with AMP (mixed precision)
+            with autocast():
+                features = actual_model.backbone(images)
+                pred = actual_model.expert_models[expert_id](features)
+                loss, _ = criterion(pred, masks)
+                loss = loss / args.accumulation_steps
 
-            # Loss (scale by accumulation steps for proper averaging)
-            loss, _ = criterion(pred, masks)
-            loss = loss / args.accumulation_steps
-
-            # Backward (accumulate gradients)
-            loss.backward()
+            # Backward (accumulate gradients) with scaled gradients
+            scaler.scale(loss).backward()
 
             # Only step optimizer every accumulation_steps
             if (batch_idx + 1) % args.accumulation_steps == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
 
             total_loss += loss.item() * args.accumulation_steps  # Unscale for logging
@@ -218,8 +223,10 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
 
         # Handle remaining gradients if last batch wasn't full accumulation step
         if (batch_idx + 1) % args.accumulation_steps != 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
 
         avg_loss = total_loss / num_batches
@@ -227,7 +234,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         # Clear CUDA cache to prevent OOM
         torch.cuda.empty_cache()
 
-        # Validation
+        # Validation with AMP
         model.eval()
         val_metrics = {}
         all_preds = []  # Collect predictions for debugging
@@ -237,9 +244,10 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                 images = images.cuda()
                 masks = masks.cuda()
 
-                features = actual_model.backbone(images)
-                pred = actual_model.expert_models[expert_id](features)
-                pred = torch.sigmoid(pred)
+                with autocast():
+                    features = actual_model.backbone(images)
+                    pred = actual_model.expert_models[expert_id](features)
+                    pred = torch.sigmoid(pred)
 
                 if is_main_process(args):
                     all_preds.append(pred.detach())
