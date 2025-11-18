@@ -106,6 +106,11 @@ def is_main_process(args):
     return args.rank == 0
 
 
+def get_model(model):
+    """Get the actual model from DDP wrapper if needed"""
+    return model.module if hasattr(model, 'module') else model
+
+
 def print_stage_info(stage, args):
     """Print information about current training stage"""
     if not is_main_process(args):
@@ -140,6 +145,8 @@ def print_stage_info(stage, args):
 def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics, args):
     """Train a single expert (Stage 1)"""
 
+    actual_model = get_model(model)
+
     # Freeze everything except the target expert
     for name, param in model.named_parameters():
         if f'expert_models.{expert_id}' in name:
@@ -148,7 +155,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             param.requires_grad = False
 
     # Also need backbone trainable
-    for param in model.backbone.parameters():
+    for param in actual_model.backbone.parameters():
         param.requires_grad = True
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -171,8 +178,8 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             masks = masks.cuda()
 
             # Forward: only this expert produces prediction
-            features = model.backbone(images)
-            pred = model.expert_models[expert_id](features)
+            features = actual_model.backbone(images)
+            pred = actual_model.expert_models[expert_id](features)
 
             # Loss
             loss, _ = criterion(pred, masks)
@@ -195,8 +202,8 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                 images = images.cuda()
                 masks = masks.cuda()
 
-                features = model.backbone(images)
-                pred = model.expert_models[expert_id](features)
+                features = actual_model.backbone(images)
+                pred = actual_model.expert_models[expert_id](features)
                 pred = torch.sigmoid(pred)
 
                 metrics.update(pred, masks)
@@ -316,6 +323,8 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
 def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, args):
     """Fine-tune full ensemble (Stage 3)"""
 
+    actual_model = get_model(model)
+
     # Unfreeze everything
     for param in model.parameters():
         param.requires_grad = True
@@ -326,9 +335,9 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
 
     # Optimizer with different LRs for different components
     optimizer = AdamW([
-        {'params': model.backbone.parameters(), 'lr': args.lr * 0.1},  # Lower LR for backbone
-        {'params': model.router.parameters(), 'lr': args.lr},
-        {'params': model.expert_models.parameters(), 'lr': args.lr * 0.5}  # Medium LR for experts
+        {'params': actual_model.backbone.parameters(), 'lr': args.lr * 0.1},  # Lower LR for backbone
+        {'params': actual_model.router.parameters(), 'lr': args.lr},
+        {'params': actual_model.expert_models.parameters(), 'lr': args.lr * 0.5}  # Medium LR for experts
     ], weight_decay=args.weight_decay)
 
     # Cosine scheduler
