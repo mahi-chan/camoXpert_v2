@@ -154,11 +154,25 @@ class COD10KDataset(Dataset):
 
         if self.augment:
             # NO RESIZE in transform - already done in cache!
+            # AGGRESSIVE augmentation to beat SOTA
             self.transform = A.Compose([
                 A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.2),
-                A.RandomRotate90(p=0.2),
-                A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, p=0.2),
+                A.VerticalFlip(p=0.3),
+                A.RandomRotate90(p=0.3),
+                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.5),
+                A.OneOf([
+                    A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                    A.MotionBlur(blur_limit=7, p=1.0),
+                ], p=0.3),
+                A.OneOf([
+                    A.OpticalDistortion(distort_limit=0.3, p=1.0),
+                    A.GridDistortion(distort_limit=0.3, p=1.0),
+                    A.ElasticTransform(alpha=1, sigma=50, p=1.0),
+                ], p=0.2),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
                 A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])

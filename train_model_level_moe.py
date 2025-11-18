@@ -26,6 +26,7 @@ import argparse
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 import torch.distributed as dist
@@ -166,6 +167,11 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
     optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                       lr=args.lr, weight_decay=args.weight_decay)
 
+    # LR Scheduler: Cosine annealing for better convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+    )
+
     # Training loop
     best_iou = 0.0
     for epoch in range(args.epochs):
@@ -212,8 +218,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         metrics.reset()
 
         if is_main_process(args):
+            current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
-                  f"IoU: {val_metrics['IoU']:.4f} | Dice: {val_metrics['Dice_Score']:.4f}")
+                  f"IoU: {val_metrics['IoU']:.4f} | Dice: {val_metrics['Dice_Score']:.4f} | LR: {current_lr:.6f}")
 
             if val_metrics['IoU'] > best_iou:
                 best_iou = val_metrics['IoU']
@@ -228,6 +235,9 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                     'optimizer_state_dict': optimizer.state_dict(),
                     'iou': best_iou
                 }, checkpoint_path)
+
+        # Step LR scheduler
+        scheduler.step()
 
     if is_main_process(args):
         print(f"\nExpert {expert_id} training complete. Best IoU: {best_iou:.4f}")
@@ -265,10 +275,24 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
             masks = masks.cuda()
 
             # Forward: router selects experts
-            pred = model(images)
+            pred, routing_info = model(images, return_routing_info=True)
 
-            # Loss
-            loss, _ = criterion(pred, masks)
+            # Segmentation loss
+            seg_loss, _ = criterion(pred, masks)
+
+            # CRITICAL: Router diversity loss (encourages expert specialization)
+            # We want experts to be used roughly equally (prevents collapse to one expert)
+            expert_probs = routing_info['expert_probs']  # [B, num_experts]
+            avg_expert_usage = expert_probs.mean(dim=0)  # [num_experts]
+            uniform_usage = torch.ones_like(avg_expert_usage) / args.num_experts
+            diversity_loss = F.kl_div(
+                avg_expert_usage.log(),
+                uniform_usage,
+                reduction='batchmean'
+            )
+
+            # Total loss: segmentation + diversity
+            loss = seg_loss + 0.01 * diversity_loss  # Small weight for diversity
 
             # Backward
             optimizer.zero_grad()
