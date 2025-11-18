@@ -77,16 +77,26 @@ def parse_args():
     parser.add_argument('--use-ddp', action='store_true', default=False)
     parser.add_argument('--local_rank', type=int, default=0)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # torchrun sets LOCAL_RANK as environment variable
+    if 'LOCAL_RANK' in os.environ:
+        args.local_rank = int(os.environ['LOCAL_RANK'])
+
+    return args
 
 
 def setup_ddp(args):
     """Initialize DDP"""
     if args.use_ddp:
         dist.init_process_group(backend='nccl')
-        torch.cuda.set_device(args.local_rank)
         args.world_size = dist.get_world_size()
         args.rank = dist.get_rank()
+
+        # Set device based on local_rank
+        print(f"[Rank {args.rank}] local_rank from args: {args.local_rank}")
+        torch.cuda.set_device(args.local_rank)
+        print(f"[Rank {args.rank}] torch.cuda.current_device(): {torch.cuda.current_device()}")
     else:
         args.world_size = 1
         args.rank = 0
