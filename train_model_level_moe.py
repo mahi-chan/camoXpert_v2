@@ -200,6 +200,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             # Backward
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Prevent gradient explosion
             optimizer.step()
 
             total_loss += loss.item()
@@ -214,6 +215,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         # Validation
         model.eval()
         val_metrics = {}
+        all_preds = []  # Collect predictions for debugging
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc="Validating", leave=False) if is_main_process(args) else val_loader
             for images, masks in val_pbar:
@@ -224,10 +226,22 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
                 pred = actual_model.expert_models[expert_id](features)
                 pred = torch.sigmoid(pred)
 
+                if is_main_process(args):
+                    all_preds.append(pred.detach())
+
                 metrics.update(pred, masks)
 
         val_metrics = metrics.compute()
         metrics.reset()
+
+        # Debug: Show prediction statistics
+        if is_main_process(args) and len(all_preds) > 0:
+            all_preds_tensor = torch.cat(all_preds, dim=0)
+            pred_min = all_preds_tensor.min().item()
+            pred_max = all_preds_tensor.max().item()
+            pred_mean = all_preds_tensor.mean().item()
+            pred_std = all_preds_tensor.std().item()
+            print(f"  Pred stats: min={pred_min:.4f}, max={pred_max:.4f}, mean={pred_mean:.4f}, std={pred_std:.4f}")
 
         if is_main_process(args):
             current_lr = optimizer.param_groups[0]['lr']
@@ -496,16 +510,16 @@ def main():
         split='train',
         img_size=args.img_size,
         cache_in_memory=True,
-        rank=args.rank if args.use_ddp else 0,
-        world_size=args.world_size if args.use_ddp else 1
+        rank=0,  # Cache all images - DistributedSampler handles splitting
+        world_size=1
     )
     val_dataset = COD10KDataset(
         root_dir=args.data_root,
         split='val',  # Use 'val' split (800 images) instead of 'test' (3200 images)
         img_size=args.img_size,
         cache_in_memory=True,
-        rank=args.rank if args.use_ddp else 0,
-        world_size=args.world_size if args.use_ddp else 1
+        rank=0,  # Cache all images - DistributedSampler handles splitting
+        world_size=1
     )
 
     if args.use_ddp:
