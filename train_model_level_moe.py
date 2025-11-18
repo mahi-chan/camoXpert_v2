@@ -67,6 +67,8 @@ def parse_args():
     parser.add_argument('--lr', type=float, default=None,
                         help='Override default LR for stage')
     parser.add_argument('--weight-decay', type=float, default=0.0001)
+    parser.add_argument('--accumulation-steps', type=int, default=1,
+                        help='Gradient accumulation steps (effective_batch = batch_size * accumulation_steps)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints_moe')
@@ -186,7 +188,7 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         else:
             pbar = train_loader
 
-        for images, masks in pbar:
+        for batch_idx, (images, masks) in enumerate(pbar):
             images = images.cuda()
             masks = masks.cuda()
 
@@ -194,21 +196,31 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
             features = actual_model.backbone(images)
             pred = actual_model.expert_models[expert_id](features)
 
-            # Loss
+            # Loss (scale by accumulation steps for proper averaging)
             loss, _ = criterion(pred, masks)
+            loss = loss / args.accumulation_steps
 
-            # Backward
-            optimizer.zero_grad()
+            # Backward (accumulate gradients)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Prevent gradient explosion
-            optimizer.step()
 
-            total_loss += loss.item()
+            # Only step optimizer every accumulation_steps
+            if (batch_idx + 1) % args.accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * args.accumulation_steps  # Unscale for logging
             num_batches += 1
 
             # Update progress bar with current loss
             if is_main_process(args):
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.set_postfix({'loss': f'{loss.item() * args.accumulation_steps:.4f}'})
+
+        # Handle remaining gradients if last batch wasn't full accumulation step
+        if (batch_idx + 1) % args.accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
 
         avg_loss = total_loss / num_batches
 
@@ -304,7 +316,7 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Router]") if is_main_process(args) else train_loader
 
-        for images, masks in pbar:
+        for batch_idx, (images, masks) in enumerate(pbar):
             images = images.cuda()
             masks = masks.cuda()
 
@@ -326,14 +338,17 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
             )
 
             # Total loss: segmentation + diversity
-            loss = seg_loss + 0.01 * diversity_loss  # Small weight for diversity
+            loss = (seg_loss + 0.01 * diversity_loss) / args.accumulation_steps
 
-            # Backward
-            optimizer.zero_grad()
+            # Backward (accumulate gradients)
             loss.backward()
-            optimizer.step()
 
-            total_loss += loss.item()
+            # Step optimizer every accumulation_steps
+            if (batch_idx + 1) % args.accumulation_steps == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * args.accumulation_steps
             num_batches += 1
 
             if is_main_process(args):
@@ -416,27 +431,31 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Full Ensemble]") if is_main_process(args) else train_loader
 
-        for images, masks in pbar:
+        for batch_idx, (images, masks) in enumerate(pbar):
             images = images.cuda()
             masks = masks.cuda()
 
             # Forward
             pred = model(images)
 
-            # Loss
+            # Loss (scale by accumulation steps)
             loss, _ = criterion(pred, masks)
+            loss = loss / args.accumulation_steps
 
-            # Backward
-            optimizer.zero_grad()
+            # Backward (accumulate gradients)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
 
-            total_loss += loss.item()
+            # Step optimizer every accumulation_steps
+            if (batch_idx + 1) % args.accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * args.accumulation_steps
             num_batches += 1
 
             if is_main_process(args):
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.set_postfix({'loss': f'{loss.item() * args.accumulation_steps:.4f}'})
 
         avg_loss = total_loss / num_batches
         scheduler.step()
