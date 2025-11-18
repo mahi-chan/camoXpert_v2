@@ -179,7 +179,13 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         total_loss = 0
         num_batches = 0
 
-        for images, masks in train_loader:
+        if is_main_process(args):
+            print(f"\n[Epoch {epoch+1}/{args.epochs}] Training Expert {expert_id}...")
+
+        for batch_idx, (images, masks) in enumerate(train_loader):
+            if is_main_process(args) and batch_idx == 0:
+                print(f"  First batch loading (CUDA compile + heavy augmentation = 30-60s)...", flush=True)
+
             images = images.cuda()
             masks = masks.cuda()
 
@@ -197,6 +203,10 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
 
             total_loss += loss.item()
             num_batches += 1
+
+            # Progress indicator every 50 batches
+            if is_main_process(args) and (batch_idx + 1) % 50 == 0:
+                print(f"  Batch {batch_idx + 1}/{len(train_loader)} | Loss: {loss.item():.4f}", flush=True)
 
         avg_loss = total_loss / num_batches
 
