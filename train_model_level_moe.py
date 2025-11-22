@@ -133,6 +133,42 @@ def get_model(model):
     return model.module if hasattr(model, 'module') else model
 
 
+def sync_metrics_across_ranks(metrics_dict, args):
+    """
+    Synchronize metrics across all DDP ranks by averaging
+
+    Args:
+        metrics_dict: Dictionary of metrics (each value is a scalar)
+        args: Arguments containing DDP info
+
+    Returns:
+        Synchronized metrics dictionary (averaged across all ranks)
+    """
+    if not args.use_ddp:
+        return metrics_dict
+
+    # Convert metrics to tensor for all_reduce
+    metrics_tensor = torch.tensor(
+        list(metrics_dict.values()),
+        dtype=torch.float32,
+        device=torch.cuda.current_device()
+    )
+
+    # Sum across all ranks
+    dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+
+    # Average by dividing by world size
+    metrics_tensor /= args.world_size
+
+    # Convert back to dictionary
+    synced_metrics = {
+        key: metrics_tensor[i].item()
+        for i, key in enumerate(metrics_dict.keys())
+    }
+
+    return synced_metrics
+
+
 def create_scheduler(optimizer, args):
     """
     Create LR scheduler based on args
@@ -345,6 +381,10 @@ def train_expert(expert_id, model, train_loader, val_loader, criterion, metrics,
         val_metrics = metrics.compute()
         metrics.reset()
 
+        # CRITICAL: Synchronize metrics across all DDP ranks
+        # Without this, we only see metrics from rank 0's validation subset!
+        val_metrics = sync_metrics_across_ranks(val_metrics, args)
+
         # Debug: Show prediction statistics
         if is_main_process(args) and len(all_preds) > 0:
             all_preds_tensor = torch.cat(all_preds, dim=0)
@@ -477,6 +517,9 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
         routing_stats = routing_info['routing_stats'] if 'routing_stats' in routing_info else {}
         metrics.reset()
 
+        # Synchronize metrics across all DDP ranks
+        val_metrics = sync_metrics_across_ranks(val_metrics, args)
+
         if is_main_process(args):
             print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
                   f"IoU: {val_metrics['IoU']:.4f} | "
@@ -583,6 +626,9 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
         val_metrics = metrics.compute()
         routing_stats = routing_info['routing_stats']
         metrics.reset()
+
+        # Synchronize metrics across all DDP ranks
+        val_metrics = sync_metrics_across_ranks(val_metrics, args)
 
         current_lr = optimizer.param_groups[0]['lr']
 
