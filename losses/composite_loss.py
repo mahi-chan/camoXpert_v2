@@ -473,6 +473,11 @@ class CompositeLossSystem(nn.Module):
         use_frequency: Enable frequency-weighted loss
         use_scale_adaptive: Enable scale-adaptive loss
         use_uncertainty: Enable uncertainty-guided loss
+        boundary_lambda_start: Starting weight for boundary loss (default: 0.5)
+        boundary_lambda_end: Ending weight for boundary loss (default: 2.0)
+        frequency_weight: Weight for high-frequency regions (default: 2.0)
+        scale_small_weight: Weight multiplier for small objects (default: 2.0)
+        uncertainty_threshold: Focus threshold for uncertainty loss (default: 0.7)
     """
     def __init__(
         self,
@@ -480,17 +485,25 @@ class CompositeLossSystem(nn.Module):
         use_boundary=True,
         use_frequency=True,
         use_scale_adaptive=True,
-        use_uncertainty=True
+        use_uncertainty=True,
+        boundary_lambda_start=0.5,
+        boundary_lambda_end=2.0,
+        frequency_weight=2.0,
+        scale_small_weight=2.0,
+        uncertainty_threshold=0.7
     ):
         super().__init__()
 
-        # Loss components
+        # Loss components (now with configurable parameters)
         self.bce_dice_loss = BCEDiceLoss(bce_weight=0.5, dice_weight=0.5)
         self.iou_loss = IoULoss()
-        self.boundary_loss = BoundaryAwareLoss(lambda_start=0.5, lambda_end=2.0)
-        self.frequency_loss = FrequencyWeightedLoss(high_freq_weight=2.0)
-        self.scale_adaptive_loss = ScaleAdaptiveLoss(small_obj_weight=2.0)
-        self.uncertainty_loss = UncertaintyGuidedLoss(focus_threshold=0.7)
+        self.boundary_loss = BoundaryAwareLoss(
+            lambda_start=boundary_lambda_start,
+            lambda_end=boundary_lambda_end
+        )
+        self.frequency_loss = FrequencyWeightedLoss(high_freq_weight=frequency_weight)
+        self.scale_adaptive_loss = ScaleAdaptiveLoss(small_obj_weight=scale_small_weight)
+        self.uncertainty_loss = UncertaintyGuidedLoss(focus_threshold=uncertainty_threshold)
 
         # Progressive weighting strategy
         self.progressive_strategy = ProgressiveWeightingStrategy(total_epochs)

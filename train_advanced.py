@@ -250,9 +250,13 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         betas=(0.9, 0.999)
     )
 
-    # Advanced CompositeLoss
+    # Advanced CompositeLoss (progressive weighting is always enabled)
     criterion = CompositeLossSystem(
-        use_progressive=True if args.loss_scheme == 'progressive' else False,
+        total_epochs=args.epochs,
+        use_boundary=True,
+        use_frequency=True,
+        use_scale_adaptive=True,
+        use_uncertainty=True,
         boundary_lambda_start=args.boundary_lambda_start,
         boundary_lambda_end=args.boundary_lambda_end,
         frequency_weight=args.frequency_weight,
