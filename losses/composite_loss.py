@@ -518,6 +518,26 @@ class CompositeLossSystem(nn.Module):
         self.iou_history = []
         self.adjustment_factor = 1.0
 
+        # Track current epoch
+        self.current_epoch = 0
+        self.total_epochs = total_epochs
+
+    def update_epoch(self, current_epoch, total_epochs=None):
+        """
+        Update the current epoch for progressive weighting and boundary lambda scheduling.
+
+        Args:
+            current_epoch: Current training epoch
+            total_epochs: Total epochs (optional, uses init value if not provided)
+        """
+        self.current_epoch = current_epoch
+        if total_epochs is not None:
+            self.total_epochs = total_epochs
+            self.progressive_strategy.total_epochs = total_epochs
+
+        # Update boundary lambda
+        self.boundary_loss.update_lambda(current_epoch, self.total_epochs)
+
     def compute_iou(self, pred, target):
         """Compute IoU for monitoring"""
         pred_sigmoid = torch.sigmoid(pred)
@@ -565,7 +585,7 @@ class CompositeLossSystem(nn.Module):
         pred,
         target,
         input_image=None,
-        current_epoch=0,
+        current_epoch=None,
         return_detailed=False
     ):
         """
@@ -575,17 +595,21 @@ class CompositeLossSystem(nn.Module):
             pred: [B, 1, H, W] predictions (logits)
             target: [B, 1, H, W] ground truth
             input_image: [B, 3, H, W] input image (for frequency weighting)
-            current_epoch: Current training epoch
+            current_epoch: Current training epoch (uses self.current_epoch if None)
             return_detailed: If True, return detailed loss breakdown
 
         Returns:
             total_loss: Scalar loss
             loss_dict: Dictionary with detailed losses (if return_detailed=True)
         """
+        # Use stored epoch if not provided
+        if current_epoch is None:
+            current_epoch = self.current_epoch
+
         # Get progressive weights
         stage_weights = self.progressive_strategy.get_weights(current_epoch)
 
-        # Update boundary lambda
+        # Boundary lambda is already updated by update_epoch(), but update again for safety
         self.boundary_loss.update_lambda(current_epoch, self.progressive_strategy.total_epochs)
 
         # Initialize loss dict
