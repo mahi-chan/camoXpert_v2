@@ -9,6 +9,21 @@ Your training script now uses:
 - ✅ **Mixed Precision** - 2-3× faster, 50% less memory
 - ✅ **MoE Optimization** - Expert collapse detection, load balancing
 
+## 🎛️ Everything is Now Configurable!
+
+**No need to push to GitHub to change settings!** All parameters are now command-line flags:
+
+| What You Want to Change | Flag to Use | Example |
+|------------------------|-------------|---------|
+| Backbone architecture | `--backbone` | `--backbone pvt_v2_b4` |
+| Number of experts | `--num-experts` | `--num-experts 6` |
+| Learning rate | `--lr` | `--lr 0.00005` |
+| Batch size | `--batch-size` | `--batch-size 8` |
+| Training epochs | `--epochs` | `--epochs 150` |
+| Loss weights | `--boundary-lambda-end` | `--boundary-lambda-end 3.0` |
+
+📖 **See CONFIGURATION_GUIDE.md for complete list of all 30+ configurable parameters**
+
 ---
 
 ## 📋 Kaggle Notebook Setup (Copy-Paste Each Cell)

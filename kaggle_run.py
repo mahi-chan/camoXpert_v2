@@ -6,6 +6,9 @@ This script integrates all new advanced modules:
 - CompositeLoss (multi-component loss with progressive weighting)
 - All COD-specific augmentations
 
+🎛️ EVERYTHING IS CONFIGURABLE VIA COMMAND-LINE FLAGS!
+See CONFIGURATION_GUIDE.md for all 30+ parameters.
+
 Just run this in a Kaggle notebook with 2 GPUs!
 """
 
@@ -13,6 +16,48 @@ Just run this in a Kaggle notebook with 2 GPUs!
 """
 !pip install timm -q
 !pip install einops -q
+"""
+
+# ====================================================================================
+# CONFIGURATION EXAMPLES
+# ====================================================================================
+
+# Standard Configuration (pvt_v2_b2, 4 experts, recommended)
+STANDARD_CONFIG = """
+torchrun --nproc_per_node=2 train_advanced.py \
+    --data-root /kaggle/input/cod10k-dataset/COD10K-v3 \
+    --epochs 100 \
+    --batch-size 12 \
+    --backbone pvt_v2_b2 \
+    --num-experts 4 \
+    --top-k 2 \
+    --use-ddp
+"""
+
+# High Performance (pvt_v2_b4, 6 experts, maximum accuracy)
+HIGH_PERFORMANCE_CONFIG = """
+torchrun --nproc_per_node=2 train_advanced.py \
+    --data-root /kaggle/input/cod10k-dataset/COD10K-v3 \
+    --epochs 150 \
+    --batch-size 8 \
+    --backbone pvt_v2_b4 \
+    --num-experts 6 \
+    --top-k 3 \
+    --lr 0.00005 \
+    --warmup-epochs 10 \
+    --boundary-lambda-end 3.0 \
+    --scale-small-weight 3.0 \
+    --use-ddp
+"""
+
+# Fast Experiment (pvt_v2_b2, fewer epochs, quick results)
+FAST_CONFIG = """
+python train_advanced.py \
+    --data-root /kaggle/input/cod10k-dataset/COD10K-v3 \
+    --epochs 80 \
+    --batch-size 8 \
+    --backbone pvt_v2_b2 \
+    --num-experts 4
 """
 
 # Training command for Kaggle (2x T4 GPUs)

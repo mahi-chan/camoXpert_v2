@@ -50,11 +50,20 @@ def parse_args():
 
     # Model
     parser.add_argument('--backbone', type=str, default='pvt_v2_b2',
-                        help='Backbone architecture')
+                        choices=['pvt_v2_b2', 'pvt_v2_b3', 'pvt_v2_b4', 'pvt_v2_b5'],
+                        help='Backbone architecture (default: pvt_v2_b2)')
     parser.add_argument('--num-experts', type=int, default=4,
-                        help='Number of experts in MoE')
+                        help='Number of experts in MoE (default: 4)')
     parser.add_argument('--top-k', type=int, default=2,
-                        help='Top-k experts to use')
+                        help='Top-k experts to use (default: 2)')
+    parser.add_argument('--pretrained', action='store_true', default=True,
+                        help='Use pretrained backbone weights')
+    parser.add_argument('--no-pretrained', action='store_false', dest='pretrained',
+                        help='Train backbone from scratch')
+    parser.add_argument('--deep-supervision', action='store_true', default=True,
+                        help='Enable deep supervision in model')
+    parser.add_argument('--no-deep-supervision', action='store_false', dest='deep_supervision',
+                        help='Disable deep supervision')
 
     # Training
     parser.add_argument('--epochs', type=int, default=100,
@@ -85,7 +94,17 @@ def parse_args():
     # CompositeLoss settings
     parser.add_argument('--loss-scheme', type=str, default='progressive',
                         choices=['progressive', 'full'],
-                        help='Loss weighting scheme')
+                        help='Loss weighting scheme (default: progressive)')
+    parser.add_argument('--boundary-lambda-start', type=float, default=0.5,
+                        help='Starting weight for boundary loss (default: 0.5)')
+    parser.add_argument('--boundary-lambda-end', type=float, default=2.0,
+                        help='Ending weight for boundary loss (default: 2.0)')
+    parser.add_argument('--frequency-weight', type=float, default=1.5,
+                        help='Weight for frequency loss (default: 1.5)')
+    parser.add_argument('--scale-small-weight', type=float, default=2.0,
+                        help='Weight for small object scale loss (default: 2.0)')
+    parser.add_argument('--uncertainty-threshold', type=float, default=0.5,
+                        help='Threshold for uncertainty loss (default: 0.5)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints_advanced',
@@ -196,8 +215,8 @@ def create_model(args, device, is_main_process):
         backbone=args.backbone,
         num_experts=args.num_experts,
         top_k=args.top_k,
-        pretrained=True,
-        use_deep_supervision=True  # Enable for better training
+        pretrained=args.pretrained,
+        use_deep_supervision=args.deep_supervision
     )
 
     model = model.to(device)
@@ -234,11 +253,11 @@ def create_optimizer_and_criterion(model, args, is_main_process):
     # Advanced CompositeLoss
     criterion = CompositeLossSystem(
         use_progressive=True if args.loss_scheme == 'progressive' else False,
-        boundary_lambda_start=0.5,
-        boundary_lambda_end=2.0,
-        frequency_weight=1.5,
-        scale_small_weight=2.0,
-        uncertainty_threshold=0.5
+        boundary_lambda_start=args.boundary_lambda_start,
+        boundary_lambda_end=args.boundary_lambda_end,
+        frequency_weight=args.frequency_weight,
+        scale_small_weight=args.scale_small_weight,
+        uncertainty_threshold=args.uncertainty_threshold
     )
 
     if is_main_process:
