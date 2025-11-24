@@ -229,12 +229,17 @@ class FFTFrequencyAnalyzer(nn.Module):
         # Pre-process to reduce channels
         x = self.pre_process(x)  # [B, 128, H, W]
 
-        # Apply 2D FFT (per channel)
-        # FFT along spatial dimensions
-        x_fft = torch.fft.rfft2(x, dim=(-2, -1), norm='ortho')  # [B, 128, H, W//2+1]
+        # Disable AMP for FFT operations (cuFFT requires power-of-2 sizes in half precision)
+        with torch.cuda.amp.autocast(enabled=False):
+            # Convert to float32 for FFT
+            x_float = x.float()
 
-        # Get magnitude spectrum
-        x_mag = torch.abs(x_fft)  # [B, 128, H, W//2+1]
+            # Apply 2D FFT (per channel)
+            # FFT along spatial dimensions
+            x_fft = torch.fft.rfft2(x_float, dim=(-2, -1), norm='ortho')  # [B, 128, H, W//2+1]
+
+            # Get magnitude spectrum
+            x_mag = torch.abs(x_fft)  # [B, 128, H, W//2+1]
 
         # Separate low and high frequency components
         # Low frequencies are in the center/low indices

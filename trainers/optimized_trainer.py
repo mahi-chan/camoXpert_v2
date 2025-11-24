@@ -14,7 +14,8 @@ Features:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 import numpy as np
@@ -774,7 +775,7 @@ class OptimizedTrainer:
                     images, masks = self.augmentation.apply(images, masks, 'random')
 
             # Forward pass with mixed precision
-            with autocast(enabled=self.use_amp):
+            with autocast('cuda', enabled=self.use_amp):
                 # Forward pass
                 outputs = self.model(images)
 
@@ -931,7 +932,7 @@ class OptimizedTrainer:
                 masks = masks.to(self.device)
 
                 # Forward pass
-                with autocast(enabled=self.use_amp):
+                with autocast('cuda', enabled=self.use_amp):
                     outputs = self.model(images)
 
                     # Handle different output formats
