@@ -230,7 +230,7 @@ class FFTFrequencyAnalyzer(nn.Module):
         x = self.pre_process(x)  # [B, 128, H, W]
 
         # Disable AMP for FFT operations (cuFFT requires power-of-2 sizes in half precision)
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             # Convert to float32 for FFT
             x_float = x.float()
 
