@@ -768,7 +768,7 @@ class OptimizedTrainer:
             masks = masks.to(self.device)
 
             # Apply progressive augmentation
-            if self.enable_progressive_aug and self.training:
+            if self.enable_progressive_aug and self.augmentation is not None:
                 # Randomly choose augmentation type
                 if torch.rand(1).item() < self.augmentation.current_strength:
                     images, masks = self.augmentation.apply(images, masks, 'random')
@@ -792,14 +792,14 @@ class OptimizedTrainer:
                     aux_outputs = None
                     routing_info = None
 
-                # Compute main loss
-                loss = self.criterion(predictions, masks)
+                # Compute main loss (pass input_image for frequency-weighted loss)
+                loss = self.criterion(predictions, masks, input_image=images)
 
                 # Add auxiliary loss if available
                 aux_loss = 0.0
                 if aux_outputs is not None and isinstance(aux_outputs, (list, tuple)):
                     for aux_pred in aux_outputs:
-                        aux_loss += 0.4 * self.criterion(aux_pred, masks)
+                        aux_loss += 0.4 * self.criterion(aux_pred, masks, input_image=images)
                     loss = loss + aux_loss
 
                 # Add load balancing loss if MoE
@@ -942,7 +942,7 @@ class OptimizedTrainer:
                     else:
                         predictions = outputs
 
-                    loss = self.criterion(predictions, masks)
+                    loss = self.criterion(predictions, masks, input_image=images)
 
                 val_loss += loss.item()
                 num_batches += 1

@@ -209,8 +209,11 @@ class ModelLevelMoE(nn.Module):
         # ============================================================
         # Return prediction with optional routing info
         # ============================================================
-        if return_routing_info:
+        # Always return routing info during training for MoE optimization
+        if return_routing_info or self.training:
             routing_info = {
+                'routing_probs': expert_probs,  # Key name expected by trainer
+                'expert_assignments': top_k_indices,  # Key name expected by trainer
                 'expert_probs': expert_probs,
                 'top_k_indices': top_k_indices,
                 'top_k_weights': top_k_weights,

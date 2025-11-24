@@ -406,7 +406,7 @@ def main():
             print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
             print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
-            if args.enable_progressive_aug:
+            if args.enable_progressive_aug and trainer.augmentation is not None:
                 print(f"  Aug Strength: {trainer.augmentation.current_strength:.3f}")
 
             # MoE statistics
