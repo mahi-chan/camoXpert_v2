@@ -360,23 +360,28 @@ class ZoomNetExpert(nn.Module):
         5x5: Balanced
         7x7: Context (zoom-out)
         """
+        # Calculate channels with proper remainder handling
+        ch1 = channels // 3
+        ch2 = channels // 3
+        ch3 = channels - ch1 - ch2  # Gets remainder
+
         return nn.ModuleList([
             # Zoom-in (small kernel, fine details)
             nn.Sequential(
-                nn.Conv2d(channels, channels // 3, 3, padding=1),
-                nn.BatchNorm2d(channels // 3),
+                nn.Conv2d(channels, ch1, 3, padding=1),
+                nn.BatchNorm2d(ch1),
                 nn.ReLU(inplace=True)
             ),
             # Balanced (medium kernel)
             nn.Sequential(
-                nn.Conv2d(channels, channels // 3, 5, padding=2),
-                nn.BatchNorm2d(channels // 3),
+                nn.Conv2d(channels, ch2, 5, padding=2),
+                nn.BatchNorm2d(ch2),
                 nn.ReLU(inplace=True)
             ),
             # Zoom-out (large kernel, broad context)
             nn.Sequential(
-                nn.Conv2d(channels, channels // 3, 7, padding=3),
-                nn.BatchNorm2d(channels // 3),
+                nn.Conv2d(channels, ch3, 7, padding=3),
+                nn.BatchNorm2d(ch3),
                 nn.ReLU(inplace=True)
             ),
             # Fusion
