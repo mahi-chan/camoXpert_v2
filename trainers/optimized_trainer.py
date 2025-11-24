@@ -549,22 +549,22 @@ class CODProgressiveAugmentation:
                 mode = np.random.choice(['horizontal', 'vertical', 'both', 'diagonal'])
 
                 if mode == 'horizontal':
-                    augmented_images[i] = torch.flip(augmented_images[i], dims=[2])
-                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[2])
+                    augmented_images[i] = torch.flip(augmented_images[i], dims=[2]).contiguous()
+                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[2]).contiguous()
 
                 elif mode == 'vertical':
-                    augmented_images[i] = torch.flip(augmented_images[i], dims=[1])
-                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[1])
+                    augmented_images[i] = torch.flip(augmented_images[i], dims=[1]).contiguous()
+                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[1]).contiguous()
 
                 elif mode == 'both':
-                    augmented_images[i] = torch.flip(augmented_images[i], dims=[1, 2])
-                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[1, 2])
+                    augmented_images[i] = torch.flip(augmented_images[i], dims=[1, 2]).contiguous()
+                    augmented_masks[i] = torch.flip(augmented_masks[i], dims=[1, 2]).contiguous()
 
                 elif mode == 'diagonal':
                     # Transpose-like operation (swap H and W)
                     if H == W:
-                        augmented_images[i] = augmented_images[i].transpose(1, 2)
-                        augmented_masks[i] = augmented_masks[i].transpose(1, 2)
+                        augmented_images[i] = augmented_images[i].transpose(1, 2).contiguous()
+                        augmented_masks[i] = augmented_masks[i].transpose(1, 2).contiguous()
 
             # Asymmetric crop and resize (if strength is high enough)
             if torch.rand(1).item() < self.current_strength * 0.5:
