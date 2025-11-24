@@ -36,21 +36,26 @@ class MultiScaleTextureAnalyzer(nn.Module):
         super().__init__()
 
         # Three parallel dilated convolution branches
+        # Note: out_channels // 3 may not divide evenly, so we calculate explicitly
+        ch1 = out_channels // 3
+        ch2 = out_channels // 3
+        ch3 = out_channels - ch1 - ch2  # Remainder goes to last branch
+
         self.dilation1 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels // 3, 3, padding=1, dilation=1),
-            nn.BatchNorm2d(out_channels // 3),
+            nn.Conv2d(in_channels, ch1, 3, padding=1, dilation=1),
+            nn.BatchNorm2d(ch1),
             nn.ReLU(inplace=True)
         )
 
         self.dilation2 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels // 3, 3, padding=2, dilation=2),
-            nn.BatchNorm2d(out_channels // 3),
+            nn.Conv2d(in_channels, ch2, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(ch2),
             nn.ReLU(inplace=True)
         )
 
         self.dilation4 = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels // 3, 3, padding=4, dilation=4),
-            nn.BatchNorm2d(out_channels // 3),
+            nn.Conv2d(in_channels, ch3, 3, padding=4, dilation=4),
+            nn.BatchNorm2d(ch3),
             nn.ReLU(inplace=True)
         )
 
