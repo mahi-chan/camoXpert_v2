@@ -275,18 +275,18 @@ def compute_metrics(predictions, targets):
     """Compute validation metrics."""
     metrics = CODMetrics()
 
-    # Threshold predictions
+    # Threshold predictions (predictions are already sigmoid'd in the model)
     preds_binary = (torch.sigmoid(predictions) > 0.5).float()
 
-    # Compute metrics
-    mae = torch.abs(preds_binary - targets).mean()
-    iou = metrics.compute_iou(preds_binary, targets)
-    f_measure = metrics.compute_f_measure(preds_binary, targets)
+    # Compute metrics using correct method names
+    mae = metrics.mae(preds_binary, targets)
+    iou = metrics.iou(preds_binary, targets)
+    f_measure = metrics.f_measure(preds_binary, targets)
 
     return {
-        'val_mae': mae.item(),
-        'val_iou': iou.item(),
-        'val_f_measure': f_measure.item()
+        'val_mae': mae,
+        'val_iou': iou,
+        'val_f_measure': f_measure
     }
 
 

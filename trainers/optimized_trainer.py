@@ -22,6 +22,11 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict, deque
 import warnings
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 
 class CosineAnnealingWithWarmup(_LRScheduler):
@@ -764,7 +769,13 @@ class OptimizedTrainer:
         # Reset gradient accumulation
         self.optimizer.zero_grad()
 
-        for batch_idx, (images, masks) in enumerate(train_loader):
+        # Wrap with tqdm if available
+        if TQDM_AVAILABLE:
+            train_iter = tqdm(train_loader, desc=f'Epoch {epoch}', ncols=100, leave=True)
+        else:
+            train_iter = train_loader
+
+        for batch_idx, (images, masks) in enumerate(train_iter):
             images = images.to(self.device)
             masks = masks.to(self.device)
 
@@ -859,11 +870,21 @@ class OptimizedTrainer:
                 avg_loss = epoch_loss / num_batches
                 current_lr = self.optimizer.param_groups[0]['lr']
 
-                print(f"Epoch [{epoch}] Batch [{batch_idx+1}/{len(train_loader)}] "
-                      f"Loss: {avg_loss:.4f} LR: {current_lr:.6f}")
-
-                if self.enable_progressive_aug:
-                    print(f"  Aug Strength: {self.augmentation.current_strength:.3f}")
+                # Update tqdm progress bar if available
+                if TQDM_AVAILABLE and isinstance(train_iter, tqdm):
+                    postfix_dict = {
+                        'loss': f'{avg_loss:.4f}',
+                        'lr': f'{current_lr:.6f}'
+                    }
+                    if self.enable_progressive_aug and self.augmentation is not None:
+                        postfix_dict['aug'] = f'{self.augmentation.current_strength:.2f}'
+                    train_iter.set_postfix(postfix_dict)
+                else:
+                    # Fallback to print if tqdm not available
+                    print(f"Epoch [{epoch}] Batch [{batch_idx+1}/{len(train_loader)}] "
+                          f"Loss: {avg_loss:.4f} LR: {current_lr:.6f}")
+                    if self.enable_progressive_aug and self.augmentation is not None:
+                        print(f"  Aug Strength: {self.augmentation.current_strength:.3f}")
 
         # Step scheduler
         self.scheduler.step()
@@ -926,8 +947,14 @@ class OptimizedTrainer:
         all_predictions = []
         all_targets = []
 
+        # Wrap validation loader with tqdm if available
+        if TQDM_AVAILABLE:
+            val_iter = tqdm(val_loader, desc='Validating', ncols=100, leave=False)
+        else:
+            val_iter = val_loader
+
         with torch.no_grad():
-            for images, masks in val_loader:
+            for images, masks in val_iter:
                 images = images.to(self.device)
                 masks = masks.to(self.device)
 
