@@ -249,6 +249,23 @@ Example: `--batch-size 12` with 2 GPUs and `--accumulation-steps 2` = **48 effec
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--seed` | int | 42 | Random seed for reproducibility |
+| `--cache-in-memory` | flag | True | Cache dataset in RAM for faster training |
+| `--no-cache` | flag | - | Disable RAM caching |
+
+**DDP-Aware Caching:**
+- With multi-GPU training, each GPU only caches its subset of data
+- Example: 2 GPUs with 3000 images → GPU 0 caches 1500, GPU 1 caches 1500
+- Recommended for Kaggle (2x T4 with 30GB RAM) - saves ~30-40% data loading time
+- Disable with `--no-cache` if memory is limited
+
+**Example:**
+```bash
+# Enable caching (default, recommended)
+torchrun --nproc_per_node=2 train_advanced.py --data-root /path/to/data
+
+# Disable caching if limited RAM
+python train_advanced.py --data-root /path/to/data --no-cache
+```
 
 ---
 

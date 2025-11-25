@@ -123,6 +123,10 @@ def parse_args():
     # System
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--cache-in-memory', action='store_true', default=True,
+                        help='Cache dataset in RAM for faster training (recommended with DDP)')
+    parser.add_argument('--no-cache', action='store_false', dest='cache_in_memory',
+                        help='Disable RAM caching')
 
     return parser.parse_args()
 
@@ -143,13 +147,15 @@ def setup_ddp(args):
 def create_dataloaders(args, is_main_process):
     """Create train and validation dataloaders."""
 
-    # Training dataset
+    # Training dataset - DDP-aware caching: each GPU caches only its subset
     train_dataset = COD10KDataset(
         root_dir=args.data_root,
         split='train',
         img_size=args.img_size,
         augment=True,  # Built-in augmentations
-        cache_in_memory=False  # Don't cache in Kaggle (limited RAM)
+        cache_in_memory=args.cache_in_memory,
+        rank=args.local_rank if args.use_ddp else 0,
+        world_size=args.world_size
     )
 
     # Validation dataset
@@ -158,7 +164,9 @@ def create_dataloaders(args, is_main_process):
         split='test',
         img_size=args.img_size,
         augment=False,
-        cache_in_memory=False
+        cache_in_memory=args.cache_in_memory,
+        rank=args.local_rank if args.use_ddp else 0,
+        world_size=args.world_size
     )
 
     # Samplers for DDP

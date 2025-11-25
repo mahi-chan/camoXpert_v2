@@ -156,6 +156,7 @@ if __name__ == '__main__':
     print("  • Gradient accumulation - simulate large batches")
     print("  • Progressive augmentation - increases after epoch 20")
     print("  • DDP support - multi-GPU training with torchrun")
+    print("  • DDP-aware RAM caching - each GPU caches its data subset (30-40% faster)")
     print()
     print("Loss Features (CompositeLoss):")
     print("  • Progressive weighting (Early/Mid/Late stages)")
