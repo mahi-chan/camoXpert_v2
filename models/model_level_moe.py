@@ -167,10 +167,11 @@ class ModelLevelMoE(nn.Module):
         # ============================================================
         # Step 2: Router decides which experts to use
         # ============================================================
-        expert_probs, top_k_indices, top_k_weights = self.router(features)
+        expert_probs, top_k_indices, top_k_weights, router_aux = self.router(features)
         # expert_probs: [B, num_experts] - full probability distribution
         # top_k_indices: [B, top_k] - indices of selected experts
         # top_k_weights: [B, top_k] - weights for selected experts (sum to 1)
+        # router_aux: dict - auxiliary outputs (confidence, load_balance_loss, etc.)
 
         # ============================================================
         # Step 3: Run selected experts and combine predictions
@@ -209,12 +210,17 @@ class ModelLevelMoE(nn.Module):
         # ============================================================
         # Return prediction with optional routing info
         # ============================================================
-        if return_routing_info:
+        # Always return routing info during training for MoE optimization
+        if return_routing_info or self.training:
             routing_info = {
+                'routing_probs': expert_probs,  # Key name expected by trainer
+                'expert_assignments': top_k_indices,  # Key name expected by trainer
                 'expert_probs': expert_probs,
                 'top_k_indices': top_k_indices,
                 'top_k_weights': top_k_weights,
-                'routing_stats': self.router.get_expert_usage_stats(expert_probs)
+                'routing_stats': self.router.get_expert_usage_stats(expert_probs),
+                'load_balance_loss': router_aux.get('load_balance_loss', None),
+                'confidence': router_aux.get('confidence', None)
             }
             return final_prediction, routing_info
         else:
