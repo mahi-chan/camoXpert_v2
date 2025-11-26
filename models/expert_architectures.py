@@ -460,9 +460,10 @@ class SINetExpert(nn.Module):
         i1 = self.identification_modules[0](r1, search_map_1)
 
         # Step 4: Partial Decoder - Progressive feature aggregation
-        d4 = self.pdc4(i4, None)        # [B, 256, H/32, W/32]
-        d3 = self.pdc3(i3, d4)          # [B, 256, H/16, W/16]
-        d2 = self.pdc2(i2, d3)          # [B, 128, H/8, W/8]
+        # All PDCs output 64 channels for consistent fusion
+        d4 = self.pdc4(i4, None)        # [B, 64, H/32, W/32]
+        d3 = self.pdc3(i3, d4)          # [B, 64, H/16, W/16]
+        d2 = self.pdc2(i2, d3)          # [B, 64, H/8, W/8]
         d1 = self.pdc1(i1, d2)          # [B, 64, H/4, W/4]
 
         # Step 5: Generate predictions
