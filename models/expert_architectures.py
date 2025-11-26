@@ -653,8 +653,10 @@ class FEDERFrequencyExpert(nn.Module):
         fused = torch.cat(resized_features, dim=1)  # [B, 64*4, H, W]
         fused = self.fusion(fused)  # [B, 64, H, W]
 
-        # Upsample to final resolution (448x448)
-        fused = F.interpolate(fused, size=(448, 448), mode='bilinear', align_corners=False)
+        # Upsample to match input resolution (dynamic, not hardcoded)
+        # Input features[0] is [B, C, H, W], output should be [B, 1, H*4, W*4]
+        output_size = (features[0].shape[2] * 4, features[0].shape[3] * 4)
+        fused = F.interpolate(fused, size=output_size, mode='bilinear', align_corners=False)
 
         # Main prediction
         pred = self.pred_head(fused)
@@ -664,8 +666,8 @@ class FEDERFrequencyExpert(nn.Module):
             aux_outputs = []
             for i, (feat, aux_head) in enumerate(zip(features[1:], self.aux_heads)):
                 aux_pred = aux_head(feat)
-                # Upsample to 448x448
-                aux_pred = F.interpolate(aux_pred, size=(448, 448), mode='bilinear', align_corners=False)
+                # Upsample aux to match output size (not hardcoded 448)
+                aux_pred = F.interpolate(aux_pred, size=output_size, mode='bilinear', align_corners=False)
                 aux_outputs.append(aux_pred)
 
             return pred, aux_outputs
