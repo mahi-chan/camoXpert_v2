@@ -50,6 +50,8 @@ from data.dataset import COD10KDataset
 from metrics.cod_metrics import CODMetrics
 from models.model_level_moe import ModelLevelMoE
 from models.utils import set_seed
+from models.multi_scale_processor import MultiScaleInputProcessor
+from models.boundary_refinement import BoundaryRefinementModule
 
 
 def parse_args():
@@ -262,6 +264,7 @@ def create_dataloaders(args, is_main_process):
 def create_model(args, device, is_main_process):
     """Create model with all enhancements."""
 
+    # Base model (ModelLevelMoE)
     model = ModelLevelMoE(
         backbone=args.backbone,
         num_experts=args.num_experts,
@@ -270,8 +273,56 @@ def create_model(args, device, is_main_process):
         use_deep_supervision=args.deep_supervision
     )
 
+    # Store original backbone for multi-scale wrapping
+    original_backbone = model.backbone
+
+    # Multi-Scale Processing Integration
+    multi_scale_processor = None
+    if args.use_multi_scale:
+        if is_main_process:
+            print(f"✓ Wrapping backbone with MultiScaleProcessor")
+            print(f"  Scales: {args.multi_scale_factors}")
+            print(f"  Hierarchical fusion: {args.use_hierarchical_fusion}")
+
+        # Determine channel list based on backbone
+        if 'pvt_v2' in args.backbone:
+            channels_list = [64, 128, 320, 512]  # PVT-v2 channels
+        else:
+            channels_list = [64, 128, 320, 512]  # Default
+
+        multi_scale_processor = MultiScaleInputProcessor(
+            backbone=original_backbone,
+            channels_list=channels_list,
+            scales=args.multi_scale_factors,
+            use_hierarchical=args.use_hierarchical_fusion
+        )
+
+        # Replace backbone with multi-scale processor
+        model.backbone = multi_scale_processor
+
+    # Boundary Refinement Integration
+    boundary_refinement = None
+    if args.use_boundary_refinement:
+        if is_main_process:
+            print(f"✓ Adding BoundaryRefinementModule")
+            print(f"  Feature channels: {args.boundary_feature_channels}")
+            print(f"  Lambda schedule: {args.boundary_lambda_schedule}")
+
+        boundary_refinement = BoundaryRefinementModule(
+            feature_channels=args.boundary_feature_channels,
+            use_gradient_loss=True,
+            use_sdt_loss=True,
+            gradient_weight=args.gradient_loss_weight,
+            sdt_weight=args.sdt_loss_weight,
+            total_epochs=args.epochs,
+            lambda_schedule_type=args.boundary_lambda_schedule
+        )
+        boundary_refinement = boundary_refinement.to(device)
+
+    # Move base model to device
     model = model.to(device)
 
+    # Wrap with DDP
     if args.use_ddp:
         model = DDP(
             model,
@@ -280,6 +331,13 @@ def create_model(args, device, is_main_process):
             find_unused_parameters=True  # For MoE models
         )
 
+        if boundary_refinement is not None:
+            boundary_refinement = DDP(
+                boundary_refinement,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank
+            )
+
     if is_main_process:
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -287,7 +345,12 @@ def create_model(args, device, is_main_process):
         print(f"✓ Total parameters: {total_params:,}")
         print(f"✓ Trainable parameters: {trainable_params:,}")
 
-    return model
+        if boundary_refinement is not None:
+            boundary_params = sum(p.numel() for p in boundary_refinement.parameters())
+            print(f"✓ Boundary refinement parameters: {boundary_params:,}")
+
+    # Return model and optional modules
+    return model, multi_scale_processor, boundary_refinement
 
 
 def create_optimizer_and_criterion(model, args, is_main_process):
@@ -322,6 +385,78 @@ def create_optimizer_and_criterion(model, args, is_main_process):
     return optimizer, criterion
 
 
+def compute_additional_losses(args, multi_scale_processor, boundary_refinement,
+                             images, predictions, targets, epoch):
+    """
+    Compute additional losses from multi-scale and boundary refinement.
+
+    Args:
+        args: Training arguments
+        multi_scale_processor: Multi-scale processor (or None)
+        boundary_refinement: Boundary refinement module (or None)
+        images: Input images
+        predictions: Model predictions
+        targets: Ground truth masks
+        epoch: Current epoch
+
+    Returns:
+        total_additional_loss: Sum of all additional losses
+        loss_dict: Dictionary with individual loss components
+    """
+    total_additional_loss = 0.0
+    loss_dict = {}
+
+    # Multi-scale losses
+    if args.use_multi_scale and multi_scale_processor is not None:
+        # Get the actual processor (unwrap DDP if needed)
+        processor = multi_scale_processor.module if hasattr(multi_scale_processor, 'module') else multi_scale_processor
+
+        # NOTE: For full multi-scale loss computation, you would need to:
+        # 1. Get scale-specific predictions from the processor
+        # 2. Compute loss for each scale
+        # 3. Weight and sum them
+        # This requires modifications to how the model processes features
+        # For now, we'll use a placeholder approach
+
+        # Placeholder: scale loss weight applied to regularization
+        scale_loss = torch.tensor(0.0, device=predictions.device)
+        loss_dict['scale_loss'] = scale_loss.item()
+        total_additional_loss += args.scale_loss_weight * scale_loss
+
+    # Boundary refinement losses
+    if args.use_boundary_refinement and boundary_refinement is not None:
+        # Get the actual module (unwrap DDP if needed)
+        boundary_module = boundary_refinement.module if hasattr(boundary_refinement, 'module') else boundary_refinement
+
+        # Set current epoch for lambda scheduling
+        boundary_module.set_epoch(epoch)
+
+        # NOTE: For full boundary refinement, you would need to:
+        # 1. Extract features from the model
+        # 2. Apply boundary refinement
+        # 3. Compute gradient + SDT losses
+        # This requires the model to expose intermediate features
+        # For now, we apply boundary losses directly to predictions
+
+        boundary_losses = boundary_module.compute_boundary_loss(
+            predictions,
+            targets,
+            intermediate_preds=None
+        )
+
+        loss_dict['boundary_loss'] = boundary_losses['total_boundary_loss'].item()
+        if 'gradient_loss' in boundary_losses:
+            loss_dict['gradient_loss'] = boundary_losses['gradient_loss'].item()
+        if 'sdt_loss' in boundary_losses:
+            loss_dict['sdt_loss'] = boundary_losses['sdt_loss'].item()
+        if 'current_lambda' in boundary_losses:
+            loss_dict['boundary_lambda'] = boundary_losses['current_lambda'].item()
+
+        total_additional_loss += args.boundary_loss_weight * boundary_losses['total_boundary_loss']
+
+    return total_additional_loss, loss_dict
+
+
 def compute_metrics(predictions, targets):
     """Compute validation metrics."""
     metrics = CODMetrics()
@@ -339,6 +474,201 @@ def compute_metrics(predictions, targets):
         'val_iou': iou,
         'val_f_measure': f_measure
     }
+
+
+def train_epoch_with_additional_losses(
+    trainer,
+    train_loader,
+    epoch: int,
+    multi_scale_processor,
+    boundary_refinement,
+    args
+):
+    """
+    Custom training epoch that incorporates additional losses from
+    multi-scale processing and boundary refinement.
+
+    This extends OptimizedTrainer's train_epoch to include:
+    - Boundary refinement losses (gradient supervision + SDT)
+    - Multi-scale losses (optional)
+    """
+    from torch.amp import autocast
+    from tqdm import tqdm
+
+    trainer.model.train()
+    trainer.current_epoch = epoch
+
+    # Update augmentation strength
+    if trainer.enable_progressive_aug:
+        trainer.augmentation.update_epoch(epoch)
+
+    epoch_loss = 0.0
+    epoch_boundary_loss = 0.0
+    epoch_gradient_loss = 0.0
+    epoch_sdt_loss = 0.0
+    num_batches = 0
+
+    # Reset gradient accumulation
+    trainer.optimizer.zero_grad()
+
+    # Progress bar
+    try:
+        train_iter = tqdm(train_loader, desc=f'Epoch {epoch}', ncols=120, leave=True)
+    except:
+        train_iter = train_loader
+
+    for batch_idx, (images, masks) in enumerate(train_iter):
+        images = images.to(trainer.device)
+        masks = masks.to(trainer.device)
+
+        # Apply progressive augmentation
+        if trainer.enable_progressive_aug and trainer.augmentation is not None:
+            if torch.rand(1).item() < trainer.augmentation.current_strength:
+                images, masks = trainer.augmentation.apply(images, masks, 'random')
+
+        # Forward pass with mixed precision
+        with autocast('cuda', enabled=trainer.use_amp):
+            # Forward pass
+            outputs = trainer.model(images)
+
+            # Handle different output formats
+            if isinstance(outputs, dict):
+                predictions = outputs['predictions']
+                aux_outputs = outputs.get('aux_outputs', None)
+                routing_info = outputs.get('routing_info', None)
+            elif isinstance(outputs, tuple):
+                predictions = outputs[0]
+                aux_outputs = outputs[1] if len(outputs) > 1 else None
+                routing_info = outputs[2] if len(outputs) > 2 else None
+            else:
+                predictions = outputs
+                aux_outputs = None
+                routing_info = None
+
+            # Compute main loss
+            loss = trainer.criterion(predictions, masks, input_image=images)
+
+            # Add auxiliary loss if available
+            aux_loss = 0.0
+            if aux_outputs is not None and isinstance(aux_outputs, (list, tuple)):
+                for aux_pred in aux_outputs:
+                    aux_loss += 0.4 * trainer.criterion(aux_pred, masks, input_image=images)
+                loss = loss + aux_loss
+
+            # Add load balancing loss if MoE
+            lb_loss = 0.0
+            if trainer.enable_load_balancing and routing_info is not None:
+                routing_probs = routing_info.get('routing_probs')
+                expert_assignments = routing_info.get('expert_assignments')
+
+                if routing_probs is not None and expert_assignments is not None:
+                    lb_loss = trainer.load_balancer.compute_load_balance_loss(
+                        routing_probs, expert_assignments
+                    )
+                    loss = loss + lb_loss
+                    trainer.load_balancer.update(routing_probs, expert_assignments)
+
+            # ========== ADDITIONAL LOSSES ==========
+            # Compute boundary refinement and multi-scale losses
+            additional_loss, loss_components = compute_additional_losses(
+                args, multi_scale_processor, boundary_refinement,
+                images, predictions, masks, epoch
+            )
+
+            # Add additional losses to total loss
+            loss = loss + additional_loss
+
+            # Scale loss for gradient accumulation
+            loss = loss / trainer.accumulation_steps
+
+        # Backward pass with gradient scaling
+        trainer.scaler.scale(loss).backward()
+
+        # Update expert collapse detector
+        if trainer.enable_collapse_detection and routing_info is not None:
+            routing_probs = routing_info.get('routing_probs')
+            expert_assignments = routing_info.get('expert_assignments')
+
+            if routing_probs is not None and expert_assignments is not None:
+                with torch.no_grad():
+                    trainer.collapse_detector.update(routing_probs, expert_assignments)
+
+        # Optimizer step after accumulation
+        if (batch_idx + 1) % trainer.accumulation_steps == 0:
+            # Gradient clipping
+            trainer.scaler.unscale_(trainer.optimizer)
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=1.0)
+
+            # Optimizer step
+            trainer.scaler.step(trainer.optimizer)
+            trainer.scaler.update()
+            trainer.optimizer.zero_grad()
+
+            trainer.global_step += 1
+
+        # Accumulate losses
+        epoch_loss += loss.item() * trainer.accumulation_steps
+        if 'boundary_loss' in loss_components:
+            epoch_boundary_loss += loss_components['boundary_loss']
+        if 'gradient_loss' in loss_components:
+            epoch_gradient_loss += loss_components['gradient_loss']
+        if 'sdt_loss' in loss_components:
+            epoch_sdt_loss += loss_components['sdt_loss']
+        num_batches += 1
+
+        # Logging
+        if (batch_idx + 1) % 20 == 0:
+            avg_loss = epoch_loss / num_batches
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+
+            # Update progress bar
+            try:
+                postfix_dict = {
+                    'loss': f'{avg_loss:.4f}',
+                    'lr': f'{current_lr:.6f}'
+                }
+                if epoch_boundary_loss > 0:
+                    postfix_dict['boundary'] = f'{epoch_boundary_loss/num_batches:.4f}'
+                if trainer.enable_progressive_aug and trainer.augmentation is not None:
+                    postfix_dict['aug'] = f'{trainer.augmentation.current_strength:.2f}'
+                train_iter.set_postfix(postfix_dict)
+            except:
+                print(f"Epoch [{epoch}] Batch [{batch_idx+1}/{len(train_loader)}] "
+                      f"Loss: {avg_loss:.4f} LR: {current_lr:.6f}")
+
+    # Step scheduler
+    trainer.scheduler.step()
+
+    # Get metrics
+    avg_loss = epoch_loss / max(num_batches, 1)
+    current_lr = trainer.optimizer.param_groups[0]['lr']
+
+    metrics = {
+        'loss': avg_loss,
+        'lr': current_lr
+    }
+
+    # Add boundary refinement metrics
+    if epoch_boundary_loss > 0:
+        metrics['boundary_loss'] = epoch_boundary_loss / num_batches
+    if epoch_gradient_loss > 0:
+        metrics['gradient_loss'] = epoch_gradient_loss / num_batches
+    if epoch_sdt_loss > 0:
+        metrics['sdt_loss'] = epoch_sdt_loss / num_batches
+
+    # Add MoE metrics
+    if trainer.enable_load_balancing:
+        lb_stats = trainer.load_balancer.get_statistics()
+        if lb_stats:
+            metrics.update(lb_stats)
+
+    if trainer.enable_collapse_detection:
+        collapsed, reasons = trainer.collapse_detector.check_collapse()
+        metrics['collapse_collapsed'] = collapsed
+        if collapsed:
+            metrics['collapse_reasons'] = reasons
+
+    return metrics
 
 
 def main():
@@ -373,11 +703,18 @@ def main():
     # Data
     train_loader, val_loader, train_sampler = create_dataloaders(args, is_main_process)
 
-    # Model
-    model = create_model(args, device, is_main_process)
+    # Model (now returns model + optional modules)
+    model, multi_scale_processor, boundary_refinement = create_model(args, device, is_main_process)
 
     # Optimizer and criterion
     optimizer, criterion = create_optimizer_and_criterion(model, args, is_main_process)
+
+    # Store additional modules for loss computation
+    trainer_kwargs = {
+        'multi_scale_processor': multi_scale_processor,
+        'boundary_refinement': boundary_refinement,
+        'args': args
+    }
 
     # OptimizedTrainer with all features
     trainer = OptimizedTrainer(
@@ -397,6 +734,11 @@ def main():
         enable_progressive_aug=args.enable_progressive_aug,
         aug_transition_epoch=args.aug_transition_epoch
     )
+
+    # Store additional modules in trainer for access during training
+    trainer.multi_scale_processor = multi_scale_processor
+    trainer.boundary_refinement = boundary_refinement
+    trainer.training_args = args
 
     if is_main_process:
         print("✓ OptimizedTrainer initialized with:")
@@ -434,12 +776,23 @@ def main():
         # Update CompositeLoss for current epoch
         criterion.update_epoch(epoch, args.epochs)
 
-        # Train one epoch
-        train_metrics = trainer.train_epoch(
-            train_loader,
-            epoch=epoch,
-            log_interval=20
-        )
+        # Set epoch for boundary refinement lambda scheduling
+        if args.use_boundary_refinement and boundary_refinement is not None:
+            boundary_module = boundary_refinement.module if hasattr(boundary_refinement, 'module') else boundary_refinement
+            boundary_module.set_epoch(epoch)
+
+        # Train one epoch (use custom training if additional losses are enabled)
+        if args.use_boundary_refinement or args.use_multi_scale:
+            train_metrics = train_epoch_with_additional_losses(
+                trainer, train_loader, epoch,
+                multi_scale_processor, boundary_refinement, args
+            )
+        else:
+            train_metrics = trainer.train_epoch(
+                train_loader,
+                epoch=epoch,
+                log_interval=20
+            )
 
         # Validate
         val_metrics = trainer.validate(
@@ -456,6 +809,14 @@ def main():
             print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
             print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
             print(f"  Learning Rate: {train_metrics['lr']:.6f}")
+
+            # Boundary refinement metrics
+            if 'boundary_loss' in train_metrics:
+                print(f"  Boundary Loss: {train_metrics['boundary_loss']:.4f}")
+            if 'gradient_loss' in train_metrics:
+                print(f"  Gradient Loss: {train_metrics['gradient_loss']:.4f}")
+            if 'sdt_loss' in train_metrics:
+                print(f"  SDT Loss: {train_metrics['sdt_loss']:.4f}")
 
             if args.enable_progressive_aug and trainer.augmentation is not None:
                 print(f"  Aug Strength: {trainer.augmentation.current_strength:.3f}")
