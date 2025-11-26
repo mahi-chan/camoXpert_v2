@@ -657,12 +657,12 @@ def train_epoch_with_additional_losses(
         metrics['sdt_loss'] = epoch_sdt_loss / num_batches
 
     # Add MoE metrics
-    if trainer.enable_load_balancing:
+    if trainer.enable_load_balancing and hasattr(trainer.load_balancer, 'get_statistics'):
         lb_stats = trainer.load_balancer.get_statistics()
         if lb_stats:
             metrics.update(lb_stats)
 
-    if trainer.enable_collapse_detection:
+    if trainer.enable_collapse_detection and hasattr(trainer, 'collapse_detector'):
         collapsed, reasons = trainer.collapse_detector.check_collapse()
         metrics['collapse_collapsed'] = collapsed
         if collapsed:
