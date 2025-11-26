@@ -861,97 +861,409 @@ class PraNetExpert(nn.Module):
 
 
 # ============================================================
-# EXPERT 3: ZoomNet-Inspired
-# Core Concept: Multi-kernel Zoom (details + context)
+# EXPERT 3: ZoomNet (Zoom in and out at Camouflaged Object Detection)
+# Paper: "ZoomNet" (CVPR 2022)
 # ============================================================
 
-class ZoomNetExpert(nn.Module):
+class HierarchicalTripletAttention(nn.Module):
     """
-    ZoomNet-Inspired: Multi-kernel zoom for multi-scale context
+    Hierarchical Triplet Attention (HTA) - Attention across 3 dimensions
 
-    Core Innovation:
-    - Small kernels (3x3): Zoom-in, capture fine details
-    - Large kernels (5x5, 7x7): Zoom-out, capture context
-    - Combine different zoom levels for robust features
-    - RFB for additional multi-scale processing
+    Applies attention across:
+    1. Channel dimension (what features)
+    2. Spatial dimension (where in image)
+    3. Scale dimension (which resolution level)
+    """
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+
+        # Channel Attention
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+
+        # Spatial Attention
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, 7, padding=3),  # 2 channels: avg + max pooling
+            nn.Sigmoid()
+        )
+
+        # Scale Attention (models inter-scale relationships)
+        self.scale_attention = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.BatchNorm2d(channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, scale_context=None):
+        """
+        Args:
+            x: Input features [B, C, H, W]
+            scale_context: Context from other scales (optional) [B, C, H, W]
+
+        Returns:
+            Attended features [B, C, H, W]
+        """
+        # Channel Attention
+        channel_att = self.channel_attention(x)
+        x_channel = x * channel_att
+
+        # Spatial Attention
+        avg_pool = torch.mean(x_channel, dim=1, keepdim=True)
+        max_pool, _ = torch.max(x_channel, dim=1, keepdim=True)
+        spatial_input = torch.cat([avg_pool, max_pool], dim=1)
+        spatial_att = self.spatial_attention(spatial_input)
+        x_spatial = x_channel * spatial_att
+
+        # Scale Attention (if cross-scale context provided)
+        if scale_context is not None:
+            # Combine current scale with context from other scales
+            combined = x_spatial + scale_context
+            scale_att = self.scale_attention(combined)
+            output = combined * scale_att
+        else:
+            output = x_spatial
+
+        return output
+
+
+class ScaleIntegrationUnit(nn.Module):
+    """
+    Scale Integration Unit (SIU) - Integrates features across multiple scales
+
+    Key innovation: Bottom-up and top-down pathways for scale communication
     """
     def __init__(self, feature_dims=[64, 128, 320, 512]):
         super().__init__()
 
-        # RFB modules for multi-scale receptive fields
+        self.feature_dims = feature_dims
+        self.num_scales = len(feature_dims)
+
+        # Lateral connections: project each scale to common dimension
+        common_dim = 256
+        self.lateral_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, common_dim, 1),
+                nn.BatchNorm2d(common_dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Top-down pathway (high-level to low-level)
+        self.top_down_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(common_dim, common_dim, 3, padding=1),
+                nn.BatchNorm2d(common_dim),
+                nn.ReLU(inplace=True)
+            ) for _ in range(self.num_scales - 1)
+        ])
+
+        # Bottom-up pathway (low-level to high-level)
+        self.bottom_up_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(common_dim, common_dim, 3, padding=1, stride=2),
+                nn.BatchNorm2d(common_dim),
+                nn.ReLU(inplace=True)
+            ) for _ in range(self.num_scales - 1)
+        ])
+
+        # Scale fusion
+        self.fusion_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(common_dim * 2, common_dim, 3, padding=1),
+                nn.BatchNorm2d(common_dim),
+                nn.ReLU(inplace=True)
+            ) for _ in range(self.num_scales)
+        ])
+
+        # Project back to original dimensions
+        self.output_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(common_dim, dim, 1),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+    def forward(self, features):
+        """
+        Args:
+            features: List of multi-scale features [f1, f2, f3, f4]
+                     Dims: [64, 128, 320, 512]
+                     Sizes: [H/4, H/8, H/16, H/32]
+
+        Returns:
+            Integrated features with same structure
+        """
+        # Step 1: Lateral connections (project to common dimension)
+        laterals = [conv(feat) for conv, feat in zip(self.lateral_convs, features)]
+
+        # Step 2: Top-down pathway (propagate high-level semantics)
+        top_down = [laterals[-1]]  # Start from highest level
+        for i in range(self.num_scales - 2, -1, -1):
+            # Upsample higher level
+            upsampled = F.interpolate(
+                top_down[0],
+                size=laterals[i].shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            # Refine with convolution
+            refined = self.top_down_convs[i](upsampled)
+            # Add to lateral
+            top_down.insert(0, refined + laterals[i])
+
+        # Step 3: Bottom-up pathway (propagate low-level details)
+        bottom_up = [top_down[0]]  # Start from lowest level
+        for i in range(self.num_scales - 1):
+            # Downsample lower level
+            downsampled = self.bottom_up_convs[i](bottom_up[-1])
+            # Add to top-down
+            bottom_up.append(downsampled + top_down[i + 1])
+
+        # Step 4: Fuse top-down and bottom-up
+        fused = []
+        for i in range(self.num_scales):
+            # Resize bottom-up to match top-down
+            if bottom_up[i].shape[2:] != top_down[i].shape[2:]:
+                bottom_up[i] = F.interpolate(
+                    bottom_up[i],
+                    size=top_down[i].shape[2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            # Concatenate and fuse
+            combined = torch.cat([top_down[i], bottom_up[i]], dim=1)
+            fused_feat = self.fusion_convs[i](combined)
+            fused.append(fused_feat)
+
+        # Step 5: Project back to original dimensions
+        outputs = [conv(feat) for conv, feat in zip(self.output_convs, fused)]
+
+        return outputs
+
+
+class AdaptiveZoomFusion(nn.Module):
+    """
+    Adaptive Zoom Fusion - Sophisticated fusion beyond simple concatenation
+
+    Uses learned attention to weight different zoom levels
+    """
+    def __init__(self, channels):
+        super().__init__()
+
+        # Attention for each zoom level
+        self.zoom_attention = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels // 4, 1, 1),
+            ) for _ in range(3)  # 3 zoom levels
+        ])
+
+        # Softmax for attention normalization
+        self.softmax = nn.Softmax(dim=1)
+
+        # Feature fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, zoom_features):
+        """
+        Args:
+            zoom_features: List of [zoom_in, zoom_balanced, zoom_out]
+
+        Returns:
+            Fused features
+        """
+        # Compute attention weight for each zoom level
+        attention_weights = []
+        for feat, att_module in zip(zoom_features, self.zoom_attention):
+            att = att_module(feat)
+            attention_weights.append(att)
+
+        # Stack and normalize with softmax
+        attention_weights = torch.cat(attention_weights, dim=1)  # [B, 3, 1, 1]
+        attention_weights = self.softmax(attention_weights)
+
+        # Apply attention weights
+        weighted_features = []
+        for i, feat in enumerate(zoom_features):
+            weight = attention_weights[:, i:i+1, :, :]
+            weighted = feat * weight
+            weighted_features.append(weighted)
+
+        # Concatenate weighted features
+        concatenated = torch.cat(weighted_features, dim=1)
+
+        # Fuse
+        output = self.fusion(concatenated)
+
+        return output
+
+
+class ZoomNetExpert(nn.Module):
+    """
+    ZoomNet: Zoom in and out at Camouflaged Object Detection (CVPR 2022)
+
+    Paper-Accurate Implementation with:
+    1. Multi-kernel Zoom: 3×3 (details), 5×5 (balanced), 7×7 (context)
+    2. Hierarchical Triplet Attention (HTA): Channel + Spatial + Scale attention
+    3. Scale Integration Unit (SIU): Top-down + bottom-up pathway
+    4. Adaptive Zoom Fusion: Learned weighting of zoom levels
+    5. RFB: Multi-scale receptive fields
+
+    Architecture Flow:
+        Features → RFB → Multi-kernel Zoom →
+        HTA (triplet attention) → SIU (scale integration) →
+        Adaptive Fusion → Predictions
+    """
+    def __init__(self, feature_dims=[64, 128, 320, 512]):
+        super().__init__()
+
+        self.feature_dims = feature_dims
+
+        # RFB modules for initial multi-scale processing
         self.rfb_modules = nn.ModuleList([
             RFB(dim, dim) for dim in feature_dims
         ])
 
-        # Multi-kernel Zoom modules (THIS is the core ZoomNet concept!)
-        self.zoom_modules = nn.ModuleList([
-            self._make_zoom_module(dim) for dim in feature_dims
+        # Multi-kernel zoom modules (3x3, 5x5, 7x7)
+        self.zoom_in_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim, 3, padding=1),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
         ])
 
+        self.zoom_balanced_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim, 5, padding=2),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        self.zoom_out_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim, 7, padding=3),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Adaptive Zoom Fusion
+        self.zoom_fusion = nn.ModuleList([
+            AdaptiveZoomFusion(dim) for dim in feature_dims
+        ])
+
+        # Hierarchical Triplet Attention
+        self.hta_modules = nn.ModuleList([
+            HierarchicalTripletAttention(dim, reduction=16) for dim in feature_dims
+        ])
+
+        # Scale Integration Unit (SIU)
+        self.siu = ScaleIntegrationUnit(feature_dims)
+
+        # Final refinement per scale
+        self.refinement = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim, 3, padding=1),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim, dim, 3, padding=1),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Decoder with deep supervision
         self.decoder = DeepSupervisionDecoder(feature_dims)
 
-    def _make_zoom_module(self, channels):
+    def forward(self, features, return_aux=True):
         """
-        Multi-kernel zoom: Different kernel sizes = different zoom levels
-        3x3: Details (zoom-in)
-        5x5: Balanced
-        7x7: Context (zoom-out)
+        Args:
+            features: [f1, f2, f3, f4] from backbone
+                     Dims: [64, 128, 320, 512]
+                     Sizes: [H/4, H/8, H/16, H/32]
+
+        Returns:
+            pred: Main prediction [B, 1, H, W]
+            aux_outputs: Auxiliary predictions
         """
-        # Calculate channels with proper remainder handling
-        ch1 = channels // 3
-        ch2 = channels // 3
-        ch3 = channels - ch1 - ch2  # Gets remainder
-
-        return nn.ModuleList([
-            # Zoom-in (small kernel, fine details)
-            nn.Sequential(
-                nn.Conv2d(channels, ch1, 3, padding=1),
-                nn.BatchNorm2d(ch1),
-                nn.ReLU(inplace=True)
-            ),
-            # Balanced (medium kernel)
-            nn.Sequential(
-                nn.Conv2d(channels, ch2, 5, padding=2),
-                nn.BatchNorm2d(ch2),
-                nn.ReLU(inplace=True)
-            ),
-            # Zoom-out (large kernel, broad context)
-            nn.Sequential(
-                nn.Conv2d(channels, ch3, 7, padding=3),
-                nn.BatchNorm2d(ch3),
-                nn.ReLU(inplace=True)
-            ),
-            # Fusion
-            nn.Sequential(
-                nn.Conv2d(channels, channels, 1),
-                nn.BatchNorm2d(channels),
-                nn.ReLU(inplace=True)
-            )
-        ])
-
-    def forward(self, features):
         # Step 1: Apply RFB for multi-scale receptive fields
         rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, features)]
 
-        # Step 2: Multi-kernel zoom at each scale
+        # Step 2: Multi-kernel zoom (3x3, 5x5, 7x7)
+        zoomed_features = []
+        for feat, zoom_in, zoom_balanced, zoom_out, fusion in zip(
+            rfb_features,
+            self.zoom_in_convs,
+            self.zoom_balanced_convs,
+            self.zoom_out_convs,
+            self.zoom_fusion
+        ):
+            # Apply different kernel sizes
+            z_in = zoom_in(feat)          # 3x3: fine details
+            z_balanced = zoom_balanced(feat)  # 5x5: balanced
+            z_out = zoom_out(feat)        # 7x7: broad context
+
+            # Adaptive fusion with learned attention weights
+            fused = fusion([z_in, z_balanced, z_out])
+
+            zoomed_features.append(fused + feat)  # Residual
+
+        # Step 3: Scale Integration Unit (top-down + bottom-up)
+        integrated_features = self.siu(zoomed_features)
+
+        # Step 4: Hierarchical Triplet Attention with scale context
+        attended_features = []
+        for i, (feat, hta) in enumerate(zip(integrated_features, self.hta_modules)):
+            # Get scale context (average of other scales)
+            other_scales = [integrated_features[j] for j in range(len(integrated_features)) if j != i]
+
+            # Resize other scales to current scale size
+            scale_context = []
+            for other in other_scales:
+                if other.shape[2:] != feat.shape[2:]:
+                    other = F.interpolate(other, size=feat.shape[2:], mode='bilinear', align_corners=False)
+                scale_context.append(other)
+
+            # Average scale context
+            scale_context = torch.stack(scale_context).mean(dim=0)
+
+            # Apply HTA with scale context
+            attended = hta(feat, scale_context)
+            attended_features.append(attended)
+
+        # Step 5: Final refinement
         refined_features = []
-        for feat, zoom_module in zip(rfb_features, self.zoom_modules):
-            # Apply different kernel sizes (zoom levels)
-            zoom_in = zoom_module[0](feat)     # 3x3
-            zoom_balanced = zoom_module[1](feat)  # 5x5
-            zoom_out = zoom_module[2](feat)    # 7x7
+        for feat, refine in zip(attended_features, self.refinement):
+            refined = refine(feat)
+            refined_features.append(refined + feat)  # Residual
 
-            # Concatenate all zoom levels
-            multi_zoom = torch.cat([zoom_in, zoom_balanced, zoom_out], dim=1)
-
-            # Fuse zoom levels
-            fused = zoom_module[3](multi_zoom)
-
-            refined_features.append(fused + feat)  # Residual
-
-        # Decode with deep supervision
+        # Step 6: Decode with deep supervision
         pred, aux_outputs = self.decoder(refined_features, return_aux=True)
-        return pred, aux_outputs
+
+        if return_aux:
+            return pred, aux_outputs
+
+        return pred, []
 
 
 # ============================================================
