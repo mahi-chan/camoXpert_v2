@@ -553,26 +553,16 @@ class FEDERFrequencyExpert(nn.Module):
             ) for dim in feature_dims
         ])
 
-        # Frequency fusion for each scale
+        # Frequency fusion for each scale (projects 4 subbands to 64 channels)
         self.freq_fusion = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(64 * 4, 64, 3, padding=1, bias=False),  # 4 subbands
+                nn.Conv2d(64 * 4, 64, 3, padding=1, bias=False),  # 4 subbands → 64
                 nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True)
             ) for _ in feature_dims
         ])
 
-        # Feature aggregation across scales
-        # Progressive upsampling from finest to coarsest
-        self.aggregation = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, 64, 1, bias=False),
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True)
-            ) for dim in feature_dims
-        ])
-
-        # Fusion of multi-scale frequency features
+        # Fusion of multi-scale frequency features (all scales already 64 channels)
         self.fusion = nn.Sequential(
             nn.Conv2d(64 * len(feature_dims), 128, 3, padding=1, bias=False),
             nn.BatchNorm2d(128),
@@ -648,23 +638,20 @@ class FEDERFrequencyExpert(nn.Module):
         # Target size for fusion (use second highest resolution)
         target_size = features[1].shape[2:]  # [H, W]
 
-        # Aggregate and resize all features to target size
-        aggregated = []
-        for i, (feat, agg) in enumerate(zip(enhanced_features, self.aggregation)):
-            feat_agg = agg(feat)
-
-            # Resize to target size
-            if feat_agg.shape[2:] != target_size:
-                feat_agg = F.interpolate(
-                    feat_agg, size=target_size,
+        # Resize all enhanced features to target size (they're already 64 channels)
+        resized_features = []
+        for feat in enhanced_features:
+            # Resize to target size if needed
+            if feat.shape[2:] != target_size:
+                feat = F.interpolate(
+                    feat, size=target_size,
                     mode='bilinear', align_corners=False
                 )
-
-            aggregated.append(feat_agg)
+            resized_features.append(feat)
 
         # Fuse multi-scale frequency features
-        fused = torch.cat(aggregated, dim=1)
-        fused = self.fusion(fused)
+        fused = torch.cat(resized_features, dim=1)  # [B, 64*4, H, W]
+        fused = self.fusion(fused)  # [B, 64, H, W]
 
         # Upsample to final resolution (448x448)
         fused = F.interpolate(fused, size=(448, 448), mode='bilinear', align_corners=False)
