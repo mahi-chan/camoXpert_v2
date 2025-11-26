@@ -28,7 +28,8 @@ from models.expert_architectures import (
     SINetExpert,
     PraNetExpert,
     ZoomNetExpert,
-    UJSCExpert
+    UJSCExpert,
+    FEDERFrequencyExpert
 )
 
 
@@ -88,14 +89,17 @@ class ModelLevelMoE(nn.Module):
         # ============================================================
         print("\n[3/3] Creating expert models...")
 
+        # Available expert architectures (can be customized)
+        # Using FEDER (Frequency Expert with Dynamic Edge Reconstruction)
         self.expert_models = nn.ModuleList([
-            SINetExpert(self.feature_dims),      # Expert 0: Search & Identify
-            PraNetExpert(self.feature_dims),     # Expert 1: Reverse Attention
-            ZoomNetExpert(self.feature_dims),    # Expert 2: Multi-Scale Zoom
-            UJSCExpert(self.feature_dims)        # Expert 3: Uncertainty-Guided
+            SINetExpert(self.feature_dims),           # Expert 0: Search & Identify
+            PraNetExpert(self.feature_dims),          # Expert 1: Reverse Attention
+            ZoomNetExpert(self.feature_dims),         # Expert 2: Multi-Scale Zoom
+            FEDERFrequencyExpert(self.feature_dims)   # Expert 3: Frequency-Domain
+            # UJSCExpert(self.feature_dims)           # Alternative: Uncertainty-Guided
         ])
 
-        expert_names = ["SINet-Style", "PraNet-Style", "ZoomNet-Style", "UJSC-Style"]
+        expert_names = ["SINet-Style", "PraNet-Style", "ZoomNet-Style", "FEDER-Style"]
         for i, (name, expert) in enumerate(zip(expert_names, self.expert_models)):
             params = sum(p.numel() for p in expert.parameters())
             print(f"✓ Expert {i} ({name}): {params/1e6:.1f}M parameters")

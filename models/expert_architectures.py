@@ -9,6 +9,7 @@ Core Concepts Implemented:
 - PraNet: Reverse Attention + Multi-scale RFB refinement
 - ZoomNet: Multi-kernel zoom (details + context) + aggregation
 - UJSC: Uncertainty-guided refinement + boundary enhancement
+- FEDER: Frequency Expert with Dynamic Edge Reconstruction
 
 All experts use deep supervision for better training.
 """
@@ -16,6 +17,7 @@ All experts use deep supervision for better training.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.frequency_expert import MultiScaleFrequencyExpert
 
 
 # ============================================================
@@ -497,6 +499,212 @@ class UJSCExpert(nn.Module):
         return pred, aux_outputs
 
 
+# ============================================================
+# EXPERT 5: FEDER (Frequency Expert with Dynamic Edge Reconstruction)
+# Core Concept: Frequency decomposition + ODE-based edge evolution
+# ============================================================
+
+class FEDERFrequencyExpert(nn.Module):
+    """
+    FEDER: Frequency Expert with Dynamic Edge Reconstruction
+
+    Complete Implementation with All Required Components:
+
+    1. DeepWaveletDecomposition with Learnable Haar Wavelets:
+       - Learnable Haar wavelet kernels for low/high frequency separation
+       - Adaptive decomposition with learnable mixing weights
+       - Processes at multiple scales (input dimensions [64, 128, 320, 512])
+
+    2. Frequency-Specific Attention Modules:
+       - HighFrequencyAttention: Texture/edge features with residual blocks
+       - LowFrequencyAttention: Instance normalization for color invariance
+       - Joint spatial-channel attention mechanisms
+
+    3. ODE-based Edge Reconstruction:
+       - 2nd-order Runge-Kutta solver for boundary refinement
+       - Learnable alpha/beta parameters for ODE dynamics
+       - Hamiltonian-inspired gate mechanism for stability
+
+    This expert excels at:
+    - Detecting camouflaged objects with subtle texture differences
+    - Precise boundary localization through frequency-domain analysis
+    - Robust edge reconstruction via ODE dynamics
+
+    DataParallel Compatible: All components support multi-GPU training
+    """
+    def __init__(self, feature_dims=[64, 128, 320, 512], reduction=16, ode_steps=2):
+        super().__init__()
+
+        self.feature_dims = feature_dims
+
+        # Import all frequency components
+        from models.frequency_expert import (
+            DeepWaveletDecomposition,
+            HighFrequencyAttention,
+            LowFrequencyAttention,
+            ODEEdgeReconstruction
+        )
+
+        # Scale-specific wavelet decomposition (learnable Haar wavelets)
+        self.wavelet_decomps = nn.ModuleList([
+            DeepWaveletDecomposition(dim, learnable=True)
+            for dim in feature_dims
+        ])
+
+        # Scale-specific frequency attention (NOT shared for better capacity)
+        # Each scale gets its own attention modules
+        self.high_freq_atts = nn.ModuleList([
+            HighFrequencyAttention(64, reduction) for _ in feature_dims
+        ])
+        self.low_freq_atts = nn.ModuleList([
+            LowFrequencyAttention(64, reduction=4) for _ in feature_dims
+        ])
+
+        # ODE-based edge reconstruction for each scale (2nd-order RK2 solver)
+        self.ode_edge_recons = nn.ModuleList([
+            ODEEdgeReconstruction(64, num_steps=ode_steps) for _ in feature_dims
+        ])
+
+        # Scale adapters to project to common dimension (64)
+        self.scale_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, 64, 1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Frequency fusion for each scale (projects 4 subbands to 64 channels)
+        self.freq_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(64 * 4, 64, 3, padding=1, bias=False),  # 4 subbands → 64
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            ) for _ in feature_dims
+        ])
+
+        # Fusion of multi-scale frequency features (all scales already 64 channels)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(64 * len(feature_dims), 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+        # Final prediction head
+        self.pred_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # Deep supervision auxiliary heads (for each scale)
+        self.aux_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim // 2, 3, padding=1),
+                nn.BatchNorm2d(dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim // 2, 1, 1),
+                nn.Sigmoid()
+            ) for dim in feature_dims[1:]  # Skip lowest resolution
+        ])
+
+    def forward(self, features, return_aux=False):
+        """
+        Forward pass through lightweight FEDER expert.
+
+        Args:
+            features: List of 4 feature tensors [f1, f2, f3, f4]
+                      from PVT backbone with dims [64, 128, 320, 512]
+            return_aux: If True, return auxiliary predictions for deep supervision
+
+        Returns:
+            pred: Main prediction [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions (if return_aux=True)
+        """
+        enhanced_features = []
+
+        # Process each scale with complete frequency pipeline
+        for i, (feat, wavelet, adapter, fusion, high_att, low_att, ode_recon) in enumerate(
+            zip(features, self.wavelet_decomps, self.scale_adapters, self.freq_fusion,
+                self.high_freq_atts, self.low_freq_atts, self.ode_edge_recons)
+        ):
+            # 1. Wavelet decomposition into 4 subbands (learnable Haar wavelets)
+            subbands = wavelet(feat)  # {ll, lh, hl, hh}
+
+            # 2. Project each subband to common dimension (64)
+            ll_proj = adapter(subbands['ll'])
+            lh_proj = adapter(subbands['lh'])
+            hl_proj = adapter(subbands['hl'])
+            hh_proj = adapter(subbands['hh'])
+
+            # 3. Apply frequency-specific attention with residual blocks
+            # Low-freq attention with instance normalization for color invariance
+            ll_enhanced = low_att(ll_proj)
+
+            # High-freq attention for texture/edge features
+            lh_enhanced = high_att(lh_proj)
+            hl_enhanced = high_att(hl_proj)
+            hh_enhanced = high_att(hh_proj)
+
+            # 4. Combine high-frequency components for ODE processing
+            high_freq_combined = lh_enhanced + hl_enhanced + hh_enhanced
+
+            # 5. ODE-based edge reconstruction with 2nd-order RK2 solver
+            # Learnable alpha/beta parameters + Hamiltonian-inspired stability
+            edges_reconstructed = ode_recon(high_freq_combined)
+
+            # 6. Fuse all frequency components (low + high + reconstructed edges)
+            freq_fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, edges_reconstructed], dim=1)
+            freq_fused = fusion(freq_fused)
+
+            enhanced_features.append(freq_fused)
+
+        # Target size for fusion (use second highest resolution)
+        target_size = features[1].shape[2:]  # [H, W]
+
+        # Resize all enhanced features to target size (they're already 64 channels)
+        resized_features = []
+        for feat in enhanced_features:
+            # Resize to target size if needed
+            if feat.shape[2:] != target_size:
+                feat = F.interpolate(
+                    feat, size=target_size,
+                    mode='bilinear', align_corners=False
+                )
+            resized_features.append(feat)
+
+        # Fuse multi-scale frequency features
+        fused = torch.cat(resized_features, dim=1)  # [B, 64*4, H, W]
+        fused = self.fusion(fused)  # [B, 64, H, W]
+
+        # Upsample to match input resolution (dynamic, not hardcoded)
+        # Input features[0] is [B, C, H, W], output should be [B, 1, H*4, W*4]
+        output_size = (features[0].shape[2] * 4, features[0].shape[3] * 4)
+        fused = F.interpolate(fused, size=output_size, mode='bilinear', align_corners=False)
+
+        # Main prediction
+        pred = self.pred_head(fused)
+
+        if return_aux:
+            # Generate auxiliary predictions from original features (not enhanced)
+            aux_outputs = []
+            for i, (feat, aux_head) in enumerate(zip(features[1:], self.aux_heads)):
+                aux_pred = aux_head(feat)
+                # Upsample aux to match output size (not hardcoded 448)
+                aux_pred = F.interpolate(aux_pred, size=output_size, mode='bilinear', align_corners=False)
+                aux_outputs.append(aux_pred)
+
+            return pred, aux_outputs
+
+        # Return tuple even when aux not requested (for MoE compatibility)
+        return pred, []
+
+
 def count_parameters(model):
     """Count trainable parameters"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -518,7 +726,8 @@ if __name__ == '__main__':
         ("SINet-Inspired", SINetExpert()),
         ("PraNet-Inspired", PraNetExpert()),
         ("ZoomNet-Inspired", ZoomNetExpert()),
-        ("UJSC-Inspired", UJSCExpert())
+        ("UJSC-Inspired", UJSCExpert()),
+        ("FEDER (Frequency Expert)", FEDERFrequencyExpert())
     ]
 
     for name, expert in experts:
@@ -538,4 +747,5 @@ if __name__ == '__main__':
     print("  SINet: Search→Identify + RFB at ALL scales")
     print("  PraNet: Reverse Attention + RFB at ALL scales + Edge guidance")
     print("  ZoomNet: Multi-kernel zoom (3x3, 5x5, 7x7) + RFB")
+    print("  FEDER: Frequency decomposition + ODE edge reconstruction + Dual attention")
     print("  UJSC: Uncertainty-guided refinement + Boundary enhancement")
