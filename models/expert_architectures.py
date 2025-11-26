@@ -484,89 +484,380 @@ class SINetExpert(nn.Module):
 
 
 # ============================================================
-# EXPERT 2: PraNet-Inspired
-# Core Concept: Reverse Attention (learn background) + Multi-scale RFB
+# EXPERT 2: PraNet (Parallel Reverse Attention Network)
+# Paper: "PraNet: Parallel Reverse Attention Network" (MICCAI 2020)
 # ============================================================
+
+class GlobalContextModule(nn.Module):
+    """
+    Global Context Module (GCM) - Captures global context with attention
+
+    Uses global pooling + channel attention to model global dependencies
+    """
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+
+        # Global average pooling
+        self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # Channel attention
+        self.channel_attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // reduction, in_channels, 1),
+            nn.Sigmoid()
+        )
+
+        # Spatial attention with larger receptive field
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # Context fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input features [B, C, H, W]
+        Returns:
+            Context-enhanced features [B, C, H, W]
+        """
+        # Channel attention
+        channel_att = self.channel_attention(self.gap(x))
+        x_channel = x * channel_att
+
+        # Spatial attention
+        spatial_att = self.spatial_attention(x_channel)
+        x_spatial = x_channel * spatial_att
+
+        # Fusion
+        output = self.fusion(x_spatial + x)
+
+        return output
+
+
+class EdgeDetectionModule(nn.Module):
+    """
+    Edge Detection Module - Uses Sobel and Laplacian operators
+
+    Combines learnable edge detection with classical operators for robust edges
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+
+        # Sobel filters for gradient detection
+        # Horizontal Sobel
+        sobel_x = torch.tensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # Vertical Sobel
+        sobel_y = torch.tensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # Laplacian for edge enhancement
+        laplacian = torch.tensor([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ], dtype=torch.float32).view(1, 1, 3, 3)
+
+        # Register as buffers (not trainable, but moved with model)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+        self.register_buffer('laplacian', laplacian)
+
+        # Channel-wise feature projection
+        self.channel_proj = nn.Conv2d(in_channels, 1, 1)
+
+        # Learnable edge enhancement
+        self.edge_enhance = nn.Sequential(
+            nn.Conv2d(4, 16, 3, padding=1),  # 4 = sobel_x + sobel_y + laplacian + learned
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input features [B, C, H, W]
+        Returns:
+            Edge map [B, 1, H, W]
+        """
+        # Project to single channel
+        x_proj = self.channel_proj(x)
+
+        # Apply Sobel operators
+        sobel_x_out = F.conv2d(x_proj, self.sobel_x, padding=1)
+        sobel_y_out = F.conv2d(x_proj, self.sobel_y, padding=1)
+
+        # Sobel magnitude
+        sobel_mag = torch.sqrt(sobel_x_out**2 + sobel_y_out**2 + 1e-6)
+
+        # Apply Laplacian
+        laplacian_out = F.conv2d(x_proj, self.laplacian, padding=1)
+        laplacian_out = torch.abs(laplacian_out)
+
+        # Learnable edge from original features
+        learned_edge = torch.sigmoid(x_proj)
+
+        # Concatenate all edge responses
+        edge_features = torch.cat([
+            sobel_mag,
+            laplacian_out,
+            sobel_x_out,
+            learned_edge
+        ], dim=1)
+
+        # Enhance and fuse
+        edge_map = self.edge_enhance(edge_features)
+
+        return edge_map
+
+
+class ReverseAttention(nn.Module):
+    """
+    Reverse Attention Module - Predicts background to infer foreground
+
+    Key insight: It's easier to learn what's NOT the object (background)
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+
+        self.background_predictor = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, in_channels // 4, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input features [B, C, H, W]
+        Returns:
+            fg_map: Foreground attention [B, 1, H, W]
+            bg_map: Background attention [B, 1, H, W]
+        """
+        # Predict background
+        bg_map = self.background_predictor(x)
+
+        # Infer foreground (reverse)
+        fg_map = 1 - bg_map
+
+        return fg_map, bg_map
+
+
+class ParallelPartialDecoder(nn.Module):
+    """
+    Parallel Partial Decoder (PPD) - Key component of PraNet
+
+    Unlike sequential decoders, PPD processes all levels in parallel,
+    then aggregates them. This provides better gradient flow and
+    allows each level to contribute independently.
+    """
+    def __init__(self, in_channels_list, out_channels=64):
+        super().__init__()
+
+        # Parallel processing for each level
+        self.level_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_channels, out_channels, 3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ) for in_ch in in_channels_list
+        ])
+
+        # Aggregation of all levels
+        self.aggregation = nn.Sequential(
+            nn.Conv2d(out_channels * len(in_channels_list), out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, features):
+        """
+        Args:
+            features: List of multi-level features [f1, f2, f3, f4]
+        Returns:
+            Aggregated features [B, out_channels, H, W]
+        """
+        # Target size (use highest resolution)
+        target_size = features[0].shape[2:]
+
+        # Process each level in parallel
+        processed = []
+        for feat, conv in zip(features, self.level_convs):
+            # Process
+            proc = conv(feat)
+            # Resize to target size
+            if proc.shape[2:] != target_size:
+                proc = F.interpolate(proc, size=target_size, mode='bilinear', align_corners=False)
+            processed.append(proc)
+
+        # Concatenate all levels
+        concatenated = torch.cat(processed, dim=1)
+
+        # Aggregate
+        output = self.aggregation(concatenated)
+
+        return output
+
 
 class PraNetExpert(nn.Module):
     """
-    PraNet-Inspired: Reverse Attention with multi-scale RFB refinement
+    PraNet: Parallel Reverse Attention Network (MICCAI 2020)
 
-    Core Innovation:
-    - Reverse Attention: Predict what's NOT the object (background)
-    - Foreground = 1 - Background (implicit learning)
-    - RFB at ALL scales for robust features
-    - Edge-aware refinement
+    Paper-Accurate Implementation with:
+    1. Reverse Attention Module: Predicts background to infer foreground
+    2. Global Context Module (GCM): Captures global dependencies
+    3. Edge Detection Module: Sobel + Laplacian + learnable edges
+    4. Parallel Partial Decoder (PPD): Processes all levels in parallel
+    5. RFB: Multi-scale receptive fields
+
+    Architecture Flow:
+        Features → RFB → GCM (global context) →
+        Reverse Attention (fg/bg) → Edge Detection →
+        Feature Refinement → Parallel Partial Decoder → Predictions
     """
     def __init__(self, feature_dims=[64, 128, 320, 512]):
         super().__init__()
 
-        # CRITICAL: RFB at ALL feature levels (this was missing!)
+        self.feature_dims = feature_dims
+
+        # RFB at all feature levels
         self.rfb_modules = nn.ModuleList([
             RFB(dim, dim) for dim in feature_dims
         ])
 
-        # Reverse Attention: Predict background at each scale
+        # Global Context Modules for each level
+        self.gcm_modules = nn.ModuleList([
+            GlobalContextModule(dim, reduction=16) for dim in feature_dims
+        ])
+
+        # Reverse Attention Modules
         self.reverse_attention_modules = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim // 4, 3, padding=1),
-                nn.BatchNorm2d(dim // 4),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim // 4, 1, 1),
-                nn.Sigmoid()
-            ) for dim in feature_dims
+            ReverseAttention(dim) for dim in feature_dims
         ])
 
-        # Boundary/Edge awareness
+        # Edge Detection Modules (Sobel + Laplacian)
         self.edge_modules = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim // 2, 3, padding=1),
-                nn.BatchNorm2d(dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim // 2, 1, 1),
-                nn.Sigmoid()
-            ) for dim in feature_dims
+            EdgeDetectionModule(dim) for dim in feature_dims
         ])
 
-        # Feature refinement
+        # Feature Refinement with fg/bg/edge guidance
         self.refine_modules = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim + 2, dim, 3, padding=1),  # +2 for bg_map and edge_map
+                nn.Conv2d(dim + 2, dim, 3, padding=1),  # +2 for fg_map and edge_map
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim, dim, 3, padding=1),
                 nn.BatchNorm2d(dim),
                 nn.ReLU(inplace=True)
             ) for dim in feature_dims
         ])
 
-        self.decoder = DeepSupervisionDecoder(feature_dims)
+        # Parallel Partial Decoder (PPD) - Key component!
+        self.ppd = ParallelPartialDecoder(feature_dims, out_channels=64)
 
-    def forward(self, features):
-        # Step 1: Apply RFB to ALL levels
+        # Prediction heads
+        self.main_pred = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1)
+        )
+
+        # Auxiliary prediction heads for deep supervision
+        self.aux_heads = nn.ModuleList([
+            nn.Conv2d(dim, 1, 1) for dim in feature_dims
+        ])
+
+    def forward(self, features, return_aux=True):
+        """
+        Args:
+            features: [f1, f2, f3, f4] from backbone
+                     Dims: [64, 128, 320, 512]
+                     Sizes: [H/4, H/8, H/16, H/32]
+        Returns:
+            pred: Main prediction [B, 1, H, W]
+            aux_outputs: Auxiliary predictions (fg maps from each level)
+        """
+        # Step 1: Apply RFB to all levels
         rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, features)]
 
-        # Step 2: Reverse Attention + Edge-guided refinement
+        # Step 2: Global Context Modeling
+        gcm_features = [gcm(feat) for gcm, feat in zip(self.gcm_modules, rfb_features)]
+
+        # Step 3: Reverse Attention + Edge Detection + Refinement
         refined_features = []
+        fg_maps = []
         for feat, reverse_attn, edge_module, refine in zip(
-            rfb_features, self.reverse_attention_modules, self.edge_modules, self.refine_modules
+            gcm_features, self.reverse_attention_modules, self.edge_modules, self.refine_modules
         ):
-            # Predict BACKGROUND (reverse attention)
-            bg_map = reverse_attn(feat)
+            # Reverse attention: predict foreground from background
+            fg_map, bg_map = reverse_attn(feat)
+            fg_maps.append(fg_map)
 
-            # Infer FOREGROUND
-            fg_map = 1 - bg_map
-
-            # Predict edges/boundaries
+            # Edge detection using Sobel + Laplacian
             edge_map = edge_module(feat * fg_map)
 
-            # Concatenate feature with fg_map and edge_map
+            # Concatenate feature with guidance
             feat_with_guidance = torch.cat([feat, fg_map, edge_map], dim=1)
 
-            # Refine with guidance
+            # Refine features
             refined = refine(feat_with_guidance)
             refined_features.append(refined + feat)  # Residual
 
-        # Decode with deep supervision
-        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
-        return pred, aux_outputs
+        # Step 4: Parallel Partial Decoder (PPD)
+        # Process all levels in parallel, then aggregate
+        aggregated = self.ppd(refined_features)
+
+        # Step 5: Generate predictions
+        output_size = (features[0].shape[2] * 4, features[0].shape[3] * 4)
+
+        # Upsample aggregated features
+        aggregated = F.interpolate(aggregated, size=output_size, mode='bilinear', align_corners=False)
+
+        # Main prediction
+        pred = self.main_pred(aggregated)
+
+        if return_aux:
+            # Auxiliary predictions from foreground maps at each level
+            aux_outputs = []
+            for fg_map in fg_maps:
+                aux = F.interpolate(fg_map, size=output_size, mode='bilinear', align_corners=False)
+                aux_outputs.append(aux)
+
+            return pred, aux_outputs
+
+        return pred, []
 
 
 # ============================================================
