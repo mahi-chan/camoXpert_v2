@@ -172,73 +172,315 @@ class DeepSupervisionDecoder(nn.Module):
 
 
 # ============================================================
-# EXPERT 1: SINet-Inspired
-# Core Concept: Search (global attention) → Identify (local refinement)
+# EXPERT 1: SINet (Search and Identification Network)
+# Paper: "Camouflaged Object Detection" (CVPR 2020)
 # ============================================================
+
+class SearchModule(nn.Module):
+    """
+    Search Module (SM) - Multi-scale context aggregation for coarse localization
+
+    Uses pyramid pooling to capture context at multiple scales
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+
+        # Pyramid pooling at different scales
+        self.pool_scales = [1, 2, 3, 6]  # Global, 2x2, 3x3, 6x6
+
+        # Convolution for each pooling scale
+        self.pool_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(scale),
+                nn.Conv2d(in_channels, in_channels // 4, 1),
+                nn.BatchNorm2d(in_channels // 4),
+                nn.ReLU(inplace=True)
+            ) for scale in self.pool_scales
+        ])
+
+        # Fusion of multi-scale context
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels + len(self.pool_scales) * (in_channels // 4), in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Search attention map
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 4, 1),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 4, 1, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        """
+        Args:
+            x: High-level features [B, C, H, W]
+        Returns:
+            search_map: Attention map indicating candidate regions [B, 1, H, W]
+            context: Context-enhanced features [B, C, H, W]
+        """
+        h, w = x.shape[2:]
+
+        # Multi-scale pyramid pooling
+        pool_features = []
+        for pool_conv in self.pool_convs:
+            pooled = pool_conv(x)
+            # Upsample back to original size
+            upsampled = F.interpolate(pooled, size=(h, w), mode='bilinear', align_corners=False)
+            pool_features.append(upsampled)
+
+        # Concatenate original features + all pooled features
+        fused = torch.cat([x] + pool_features, dim=1)
+
+        # Fusion
+        context = self.fusion(fused)
+
+        # Generate search attention map
+        search_map = self.attention(context)
+
+        return search_map, context
+
+
+class IdentificationModule(nn.Module):
+    """
+    Identification Module (IM) - Group-wise enhancement for fine localization
+
+    Uses group convolutions to efficiently enhance discriminative features
+    """
+    def __init__(self, in_channels, groups=4):
+        super().__init__()
+
+        self.groups = groups
+
+        # Group-wise convolution for efficient feature enhancement
+        self.group_conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1, groups=groups),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Channel shuffle for inter-group communication
+        self.shuffle = True
+
+        # Enhancement with residual
+        self.enhance = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels)
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def channel_shuffle(self, x):
+        """Shuffle channels for inter-group communication"""
+        batch_size, channels, h, w = x.shape
+        channels_per_group = channels // self.groups
+
+        # Reshape and transpose
+        x = x.view(batch_size, self.groups, channels_per_group, h, w)
+        x = x.transpose(1, 2).contiguous()
+        x = x.view(batch_size, channels, h, w)
+
+        return x
+
+    def forward(self, x, search_map):
+        """
+        Args:
+            x: Features [B, C, H, W]
+            search_map: Search attention from SM [B, 1, H, W]
+        Returns:
+            Enhanced features [B, C, H, W]
+        """
+        # Apply search attention
+        attended = x * (1 + search_map)
+
+        # Group-wise convolution
+        group_features = self.group_conv(attended)
+
+        # Channel shuffle
+        if self.shuffle:
+            group_features = self.channel_shuffle(group_features)
+
+        # Enhancement with residual
+        enhanced = self.enhance(group_features)
+        output = self.relu(enhanced + x)
+
+        return output
+
+
+class PartialDecoderComponent(nn.Module):
+    """
+    Partial Decoder Component (PDC) - Aggregates multi-level features
+
+    Progressive refinement from high-level to low-level features
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        # Reduce channels
+        self.reduce = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        # Refinement
+        self.refine = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, high_level, low_level=None):
+        """
+        Args:
+            high_level: Higher-level features (coarser)
+            low_level: Lower-level features (finer), optional
+        Returns:
+            Refined features
+        """
+        # Reduce channels
+        high = self.reduce(high_level)
+
+        # If low-level features provided, fuse them
+        if low_level is not None:
+            # Upsample high-level to match low-level size
+            h, w = low_level.shape[2:]
+            high = F.interpolate(high, size=(h, w), mode='bilinear', align_corners=False)
+
+            # Reduce low-level channels
+            low = self.reduce(low_level)
+
+            # Add features
+            fused = high + low
+        else:
+            fused = high
+
+        # Refine
+        refined = self.refine(fused)
+
+        return refined
+
 
 class SINetExpert(nn.Module):
     """
-    SINet-Inspired: Search then Identify with multi-scale RFB
+    SINet: Search and Identification Network (CVPR 2020)
 
-    Core Innovation:
-    - Search Module: Find candidate regions using global context
-    - Identify Module: Refine candidates with local features
-    - RFB at ALL scales for multi-receptive field features
+    Paper-Accurate Implementation with:
+    1. Search Module (SM): Multi-scale pyramid pooling for coarse localization
+    2. Identification Module (IM): Group-wise enhancement for fine localization
+    3. Partial Decoder Component (PDC): Progressive multi-level feature aggregation
+    4. RFB: Receptive Field Blocks at all scales
+
+    Architecture Flow:
+        Features → RFB → Search Module (highest level) →
+        Identification Module (all levels with search guidance) →
+        Partial Decoder Components (progressive fusion) →
+        Prediction
     """
     def __init__(self, feature_dims=[64, 128, 320, 512]):
         super().__init__()
 
-        # CRITICAL: RFB at ALL feature levels (not just highest!)
+        self.feature_dims = feature_dims
+
+        # RFB at ALL feature levels for multi-receptive field features
         self.rfb_modules = nn.ModuleList([
             RFB(dim, dim) for dim in feature_dims
         ])
 
-        # Search Module: Global attention on highest features
-        self.search_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(feature_dims[-1], feature_dims[-1] // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(feature_dims[-1] // 4, 1, 1),
-            nn.Sigmoid()
-        )
+        # Search Module on highest-level features
+        self.search_module = SearchModule(feature_dims[-1])
 
-        # Identify Module: Local refinement per scale
-        self.identify_modules = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+        # Identification Modules for each scale
+        self.identification_modules = nn.ModuleList([
+            IdentificationModule(dim, groups=4) for dim in feature_dims
         ])
 
-        self.decoder = DeepSupervisionDecoder(feature_dims)
+        # Partial Decoder Components for progressive fusion
+        # PDC4: f4 only (highest level)
+        # PDC3: f4 + f3
+        # PDC2: (f4+f3) + f2
+        # PDC1: ((f4+f3)+f2) + f1
+        self.pdc4 = PartialDecoderComponent(feature_dims[3], 256)
+        self.pdc3 = PartialDecoderComponent(feature_dims[2], 256)
+        self.pdc2 = PartialDecoderComponent(feature_dims[1], 128)
+        self.pdc1 = PartialDecoderComponent(feature_dims[0], 64)
 
-    def forward(self, features):
-        # Step 1: Apply RFB to ALL levels for multi-scale receptive fields
-        rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, features)]
+        # Final prediction heads
+        self.pred_head4 = nn.Conv2d(256, 1, 1)
+        self.pred_head3 = nn.Conv2d(256, 1, 1)
+        self.pred_head2 = nn.Conv2d(128, 1, 1)
+        self.pred_head1 = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1)
+        )
 
-        # Step 2: SEARCH - Generate global attention from highest level
-        search_attention = self.search_attention(rfb_features[-1])  # [B, 1, 1, 1]
+    def forward(self, features, return_aux=True):
+        """
+        Args:
+            features: [f1, f2, f3, f4] from backbone
+                     Dims: [64, 128, 320, 512]
+                     Sizes: [H/4, H/8, H/16, H/32]
+        Returns:
+            pred: Main prediction [B, 1, H, W]
+            aux_outputs: [pred4, pred3, pred2] auxiliary predictions
+        """
+        f1, f2, f3, f4 = features
 
-        # Step 3: IDENTIFY - Apply attention and refine at each scale
-        refined_features = []
-        for i, (feat, identify) in enumerate(zip(rfb_features, self.identify_modules)):
-            # Broadcast attention to feature size
-            attn = F.interpolate(search_attention, size=feat.shape[2:], mode='bilinear', align_corners=False)
+        # Step 1: Apply RFB to ALL levels
+        r1 = self.rfb_modules[0](f1)
+        r2 = self.rfb_modules[1](f2)
+        r3 = self.rfb_modules[2](f3)
+        r4 = self.rfb_modules[3](f4)
 
-            # Attention-weighted features
-            attended = feat * (1 + attn)  # Boost attended regions
+        # Step 2: SEARCH - Generate search map from highest level
+        search_map, context4 = self.search_module(r4)
 
-            # Local refinement
-            refined = identify(attended)
-            refined_features.append(refined + feat)  # Residual
+        # Step 3: IDENTIFY - Apply search guidance at all levels
+        # Resize search map to each level
+        search_map_3 = F.interpolate(search_map, size=r3.shape[2:], mode='bilinear', align_corners=False)
+        search_map_2 = F.interpolate(search_map, size=r2.shape[2:], mode='bilinear', align_corners=False)
+        search_map_1 = F.interpolate(search_map, size=r1.shape[2:], mode='bilinear', align_corners=False)
 
-        # Decode with deep supervision
-        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
-        return pred, aux_outputs
+        # Apply identification modules
+        i4 = self.identification_modules[3](context4, search_map)
+        i3 = self.identification_modules[2](r3, search_map_3)
+        i2 = self.identification_modules[1](r2, search_map_2)
+        i1 = self.identification_modules[0](r1, search_map_1)
+
+        # Step 4: Partial Decoder - Progressive feature aggregation
+        d4 = self.pdc4(i4, None)        # [B, 256, H/32, W/32]
+        d3 = self.pdc3(i3, d4)          # [B, 256, H/16, W/16]
+        d2 = self.pdc2(i2, d3)          # [B, 128, H/8, W/8]
+        d1 = self.pdc1(i1, d2)          # [B, 64, H/4, W/4]
+
+        # Step 5: Generate predictions
+        # Compute output size (4x f1 size)
+        output_size = (f1.shape[2] * 4, f1.shape[3] * 4)
+
+        # Main prediction from finest level
+        pred = self.pred_head1(d1)
+        pred = F.interpolate(pred, size=output_size, mode='bilinear', align_corners=False)
+
+        if return_aux:
+            # Auxiliary predictions from coarser levels
+            aux4 = F.interpolate(self.pred_head4(d4), size=output_size, mode='bilinear', align_corners=False)
+            aux3 = F.interpolate(self.pred_head3(d3), size=output_size, mode='bilinear', align_corners=False)
+            aux2 = F.interpolate(self.pred_head2(d2), size=output_size, mode='bilinear', align_corners=False)
+
+            return pred, [aux4, aux3, aux2]
+
+        return pred, []
 
 
 # ============================================================
