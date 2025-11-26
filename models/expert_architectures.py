@@ -506,18 +506,29 @@ class UJSCExpert(nn.Module):
 
 class FEDERFrequencyExpert(nn.Module):
     """
-    FEDER: Frequency Expert with Dynamic Edge Reconstruction (Lightweight)
+    FEDER: Frequency Expert with Dynamic Edge Reconstruction
 
-    Core Innovation:
-    - Deep Wavelet Decomposition: Learnable Haar wavelets for frequency separation
-    - Dual Attention: Separate processing for high-freq (edges) and low-freq (semantics)
-    - Shared frequency processing across scales for efficiency
-    - Multi-Scale Integration: Processes all PVT scales [64, 128, 320, 512]
+    Complete Implementation with All Required Components:
+
+    1. DeepWaveletDecomposition with Learnable Haar Wavelets:
+       - Learnable Haar wavelet kernels for low/high frequency separation
+       - Adaptive decomposition with learnable mixing weights
+       - Processes at multiple scales (input dimensions [64, 128, 320, 512])
+
+    2. Frequency-Specific Attention Modules:
+       - HighFrequencyAttention: Texture/edge features with residual blocks
+       - LowFrequencyAttention: Instance normalization for color invariance
+       - Joint spatial-channel attention mechanisms
+
+    3. ODE-based Edge Reconstruction:
+       - 2nd-order Runge-Kutta solver for boundary refinement
+       - Learnable alpha/beta parameters for ODE dynamics
+       - Hamiltonian-inspired gate mechanism for stability
 
     This expert excels at:
     - Detecting camouflaged objects with subtle texture differences
     - Precise boundary localization through frequency-domain analysis
-    - Efficient frequency-domain processing
+    - Robust edge reconstruction via ODE dynamics
 
     DataParallel Compatible: All components support multi-GPU training
     """
@@ -526,23 +537,33 @@ class FEDERFrequencyExpert(nn.Module):
 
         self.feature_dims = feature_dims
 
-        # Lightweight frequency processing for each scale
-        # Use shared components to reduce parameters
+        # Import all frequency components
         from models.frequency_expert import (
             DeepWaveletDecomposition,
             HighFrequencyAttention,
-            LowFrequencyAttention
+            LowFrequencyAttention,
+            ODEEdgeReconstruction
         )
 
-        # Scale-specific wavelet decomposition (lightweight, depthwise)
+        # Scale-specific wavelet decomposition (learnable Haar wavelets)
         self.wavelet_decomps = nn.ModuleList([
             DeepWaveletDecomposition(dim, learnable=True)
             for dim in feature_dims
         ])
 
-        # Shared frequency attention modules (reused across scales)
-        self.high_freq_att = HighFrequencyAttention(64, reduction)
-        self.low_freq_att = LowFrequencyAttention(64, reduction=4)
+        # Scale-specific frequency attention (NOT shared for better capacity)
+        # Each scale gets its own attention modules
+        self.high_freq_atts = nn.ModuleList([
+            HighFrequencyAttention(64, reduction) for _ in feature_dims
+        ])
+        self.low_freq_atts = nn.ModuleList([
+            LowFrequencyAttention(64, reduction=4) for _ in feature_dims
+        ])
+
+        # ODE-based edge reconstruction for each scale (2nd-order RK2 solver)
+        self.ode_edge_recons = nn.ModuleList([
+            ODEEdgeReconstruction(64, num_steps=ode_steps) for _ in feature_dims
+        ])
 
         # Scale adapters to project to common dimension (64)
         self.scale_adapters = nn.ModuleList([
@@ -607,11 +628,12 @@ class FEDERFrequencyExpert(nn.Module):
         """
         enhanced_features = []
 
-        # Process each scale with frequency decomposition
-        for i, (feat, wavelet, adapter, fusion) in enumerate(
-            zip(features, self.wavelet_decomps, self.scale_adapters, self.freq_fusion)
+        # Process each scale with complete frequency pipeline
+        for i, (feat, wavelet, adapter, fusion, high_att, low_att, ode_recon) in enumerate(
+            zip(features, self.wavelet_decomps, self.scale_adapters, self.freq_fusion,
+                self.high_freq_atts, self.low_freq_atts, self.ode_edge_recons)
         ):
-            # 1. Wavelet decomposition into 4 subbands
+            # 1. Wavelet decomposition into 4 subbands (learnable Haar wavelets)
             subbands = wavelet(feat)  # {ll, lh, hl, hh}
 
             # 2. Project each subband to common dimension (64)
@@ -620,17 +642,24 @@ class FEDERFrequencyExpert(nn.Module):
             hl_proj = adapter(subbands['hl'])
             hh_proj = adapter(subbands['hh'])
 
-            # 3. Apply frequency-specific attention
-            # Low-freq attention on LL subband
-            ll_enhanced = self.low_freq_att(ll_proj)
+            # 3. Apply frequency-specific attention with residual blocks
+            # Low-freq attention with instance normalization for color invariance
+            ll_enhanced = low_att(ll_proj)
 
-            # High-freq attention on LH, HL, HH subbands
-            lh_enhanced = self.high_freq_att(lh_proj)
-            hl_enhanced = self.high_freq_att(hl_proj)
-            hh_enhanced = self.high_freq_att(hh_proj)
+            # High-freq attention for texture/edge features
+            lh_enhanced = high_att(lh_proj)
+            hl_enhanced = high_att(hl_proj)
+            hh_enhanced = high_att(hh_proj)
 
-            # 4. Fuse frequency components
-            freq_fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, hh_enhanced], dim=1)
+            # 4. Combine high-frequency components for ODE processing
+            high_freq_combined = lh_enhanced + hl_enhanced + hh_enhanced
+
+            # 5. ODE-based edge reconstruction with 2nd-order RK2 solver
+            # Learnable alpha/beta parameters + Hamiltonian-inspired stability
+            edges_reconstructed = ode_recon(high_freq_combined)
+
+            # 6. Fuse all frequency components (low + high + reconstructed edges)
+            freq_fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, edges_reconstructed], dim=1)
             freq_fused = fusion(freq_fused)
 
             enhanced_features.append(freq_fused)
