@@ -148,22 +148,24 @@ class DeepSupervisionDecoder(nn.Module):
         f1, f2, f3, f4 = features
 
         # Decode
-        d4 = self.decoder4(f4, f3)   # [B, 256, 28, 28]
-        d3 = self.decoder3(d4, f2)   # [B, 128, 56, 56]
-        d2 = self.decoder2(d3, f1)   # [B, 64, 112, 112]
-        d1 = self.decoder1(d2, None) # [B, 32, 224, 224]
+        d4 = self.decoder4(f4, f3)   # [B, 256, H/16, W/16]
+        d3 = self.decoder3(d4, f2)   # [B, 128, H/8, W/8]
+        d2 = self.decoder2(d3, f1)   # [B, 64, H/4, W/4]
+        d1 = self.decoder1(d2, None) # [B, 32, H/2, W/2]
 
-        # Upsample to input resolution
-        d1 = F.interpolate(d1, scale_factor=2, mode='bilinear', align_corners=False)
+        # Upsample to input resolution (dynamic based on f1 size)
+        # f1 is H/4, so final output should be H (4x upsampling total)
+        output_size = (f1.shape[2] * 4, f1.shape[3] * 4)
+        d1 = F.interpolate(d1, size=output_size, mode='bilinear', align_corners=False)
 
         # Main prediction
         pred = self.pred_head(d1)
 
         if return_aux:
-            # Auxiliary predictions (upsampled to 448x448)
-            aux4 = F.interpolate(self.aux_head4(d4), size=(448, 448), mode='bilinear', align_corners=False)
-            aux3 = F.interpolate(self.aux_head3(d3), size=(448, 448), mode='bilinear', align_corners=False)
-            aux2 = F.interpolate(self.aux_head2(d2), size=(448, 448), mode='bilinear', align_corners=False)
+            # Auxiliary predictions (upsampled to match output size)
+            aux4 = F.interpolate(self.aux_head4(d4), size=output_size, mode='bilinear', align_corners=False)
+            aux3 = F.interpolate(self.aux_head3(d3), size=output_size, mode='bilinear', align_corners=False)
+            aux2 = F.interpolate(self.aux_head2(d2), size=output_size, mode='bilinear', align_corners=False)
             return pred, [aux4, aux3, aux2]
 
         return pred
@@ -501,43 +503,46 @@ class UJSCExpert(nn.Module):
 
 # ============================================================
 # EXPERT 5: FEDER (Frequency Expert with Dynamic Edge Reconstruction)
-# Core Concept: Frequency decomposition + ODE-based edge evolution
+# Paper Architecture: Complete implementation with all components
 # ============================================================
 
 class FEDERFrequencyExpert(nn.Module):
     """
-    FEDER: Frequency Expert with Dynamic Edge Reconstruction
+    FEDER: Frequency Decomposition and Dynamic Edge Reconstruction
 
-    Complete Implementation with All Required Components:
+    Paper-Accurate Implementation:
 
-    1. DeepWaveletDecomposition with Learnable Haar Wavelets:
-       - Learnable Haar wavelet kernels for low/high frequency separation
-       - Adaptive decomposition with learnable mixing weights
-       - Processes at multiple scales (input dimensions [64, 128, 320, 512])
+    1. Deep Wavelet Decomposition (Learnable Haar Wavelets):
+       - Initialized with Haar wavelets: LL [1,1;1,1]/4, HH [1,-1;-1,1]/4
+       - Separate learnable convolutions for low and high frequency
+       - Learnable mixing weights for adaptive decomposition
 
-    2. Frequency-Specific Attention Modules:
-       - HighFrequencyAttention: Texture/edge features with residual blocks
-       - LowFrequencyAttention: Instance normalization for color invariance
-       - Joint spatial-channel attention mechanisms
+    2. Frequency-Specific Attention:
+       - HighFrequencyAttention: Residual blocks with dilated convolutions
+         + Joint spatial-channel attention for texture/edge features
+       - LowFrequencyAttention: Instance normalization for illumination invariance
+         + Global context modeling, suppress redundant patterns
 
-    3. ODE-based Edge Reconstruction:
-       - 2nd-order Runge-Kutta solver for boundary refinement
-       - Learnable alpha/beta parameters for ODE dynamics
-       - Hamiltonian-inspired gate mechanism for stability
+    3. ODE-based Edge Reconstruction (True RK2 Solver):
+       - f1 = dynamics_net(x)
+       - f2 = dynamics_net(x + alpha*f1)
+       - output = x + gate*(beta1*f1 + beta2*f2)
+       - Learnable alpha, beta1, beta2 parameters
+       - Hamiltonian-inspired stability gate
 
-    This expert excels at:
-    - Detecting camouflaged objects with subtle texture differences
-    - Precise boundary localization through frequency-domain analysis
-    - Robust edge reconstruction via ODE dynamics
+    4. Full Decoder with Deep Supervision:
+       - Progressive upsampling decoder
+       - 3 auxiliary outputs at different scales
+       - Output: [B, 1, 448, 448]
 
-    DataParallel Compatible: All components support multi-GPU training
+    Target: 12-15M parameters to match other experts
     """
-    def __init__(self, feature_dims=[64, 128, 320, 512], reduction=16, ode_steps=2):
+    def __init__(self, feature_dims=[64, 128, 320, 512]):
         super().__init__()
 
         self.feature_dims = feature_dims
 
-        # Import all frequency components
+        # Import frequency components
         from models.frequency_expert import (
             DeepWaveletDecomposition,
             HighFrequencyAttention,
@@ -545,164 +550,123 @@ class FEDERFrequencyExpert(nn.Module):
             ODEEdgeReconstruction
         )
 
-        # Scale-specific wavelet decomposition (learnable Haar wavelets)
-        self.wavelet_decomps = nn.ModuleList([
+        # 1. Deep Wavelet Decomposition for each scale
+        # Initialize with Haar wavelets, then learn optimal decomposition
+        self.wavelet_decompositions = nn.ModuleList([
             DeepWaveletDecomposition(dim, learnable=True)
             for dim in feature_dims
         ])
 
-        # Scale-specific frequency attention (NOT shared for better capacity)
-        # Each scale gets its own attention modules
-        self.high_freq_atts = nn.ModuleList([
-            HighFrequencyAttention(64, reduction) for _ in feature_dims
-        ])
-        self.low_freq_atts = nn.ModuleList([
-            LowFrequencyAttention(64, reduction=4) for _ in feature_dims
+        # 2. Frequency-specific attention modules
+        # High-frequency: residual blocks + dilated convolutions + joint attention
+        self.high_freq_attentions = nn.ModuleList([
+            HighFrequencyAttention(dim, reduction=16)
+            for dim in feature_dims
         ])
 
-        # ODE-based edge reconstruction for each scale (2nd-order RK2 solver)
-        self.ode_edge_recons = nn.ModuleList([
-            ODEEdgeReconstruction(64, num_steps=ode_steps) for _ in feature_dims
+        # Low-frequency: instance norm + global context
+        self.low_freq_attentions = nn.ModuleList([
+            LowFrequencyAttention(dim, reduction=4)
+            for dim in feature_dims
         ])
 
-        # Scale adapters to project to common dimension (64)
-        self.scale_adapters = nn.ModuleList([
+        # 3. ODE-based Edge Reconstruction (2nd-order RK2 solver)
+        self.ode_edge_modules = nn.ModuleList([
+            ODEEdgeReconstruction(dim, num_steps=2)
+            for dim in feature_dims
+        ])
+
+        # 4. Frequency fusion at each scale (combine LL, LH, HL, HH + ODE edges)
+        self.frequency_fusion = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, 64, 1, bias=False),
-                nn.BatchNorm2d(64),
+                nn.Conv2d(dim * 4, dim, 3, padding=1, bias=False),  # 4 subbands
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim, dim, 3, padding=1, bias=False),
+                nn.BatchNorm2d(dim),
                 nn.ReLU(inplace=True)
             ) for dim in feature_dims
         ])
 
-        # Frequency fusion for each scale (projects 4 subbands to 64 channels)
-        self.freq_fusion = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(64 * 4, 64, 3, padding=1, bias=False),  # 4 subbands → 64
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True)
-            ) for _ in feature_dims
-        ])
-
-        # Fusion of multi-scale frequency features (all scales already 64 channels)
-        self.fusion = nn.Sequential(
-            nn.Conv2d(64 * len(feature_dims), 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, 3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-
-        # Final prediction head
-        self.pred_head = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 1, 1),
-            nn.Sigmoid()
-        )
-
-        # Deep supervision auxiliary heads (for each scale)
-        self.aux_heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(dim, dim // 2, 3, padding=1),
-                nn.BatchNorm2d(dim // 2),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim // 2, 1, 1),
-                nn.Sigmoid()
-            ) for dim in feature_dims[1:]  # Skip lowest resolution
-        ])
+        # 5. Full decoder architecture with deep supervision
+        self.decoder = DeepSupervisionDecoder(feature_dims)
 
     def forward(self, features, return_aux=False):
         """
-        Forward pass through lightweight FEDER expert.
+        Forward pass through FEDER expert.
 
         Args:
-            features: List of 4 feature tensors [f1, f2, f3, f4]
-                      from PVT backbone with dims [64, 128, 320, 512]
-            return_aux: If True, return auxiliary predictions for deep supervision
+            features: List of 4 PVT features [f1, f2, f3, f4]
+                     Dimensions: [64, 128, 320, 512]
+                     Spatial sizes: [H/4, H/8, H/16, H/32]
 
         Returns:
             pred: Main prediction [B, 1, 448, 448]
-            aux_outputs: List of auxiliary predictions (if return_aux=True)
+            aux_outputs: List of 3 auxiliary outputs (if return_aux=True)
         """
         enhanced_features = []
 
-        # Process each scale with complete frequency pipeline
-        for i, (feat, wavelet, adapter, fusion, high_att, low_att, ode_recon) in enumerate(
-            zip(features, self.wavelet_decomps, self.scale_adapters, self.freq_fusion,
-                self.high_freq_atts, self.low_freq_atts, self.ode_edge_recons)
+        # Process each scale: wavelet → attention → ODE → fusion
+        for i, (feat, wavelet, high_att, low_att, ode_module, fusion) in enumerate(
+            zip(features,
+                self.wavelet_decompositions,
+                self.high_freq_attentions,
+                self.low_freq_attentions,
+                self.ode_edge_modules,
+                self.frequency_fusion)
         ):
-            # 1. Wavelet decomposition into 4 subbands (learnable Haar wavelets)
-            subbands = wavelet(feat)  # {ll, lh, hl, hh}
+            # Step 1: Decompose into high/low frequency subbands
+            # Returns dict: {'ll': low-low, 'lh': low-high, 'hl': high-low, 'hh': high-high}
+            subbands = wavelet(feat)
 
-            # 2. Project each subband to common dimension (64)
-            ll_proj = adapter(subbands['ll'])
-            lh_proj = adapter(subbands['lh'])
-            hl_proj = adapter(subbands['hl'])
-            hh_proj = adapter(subbands['hh'])
+            ll = subbands['ll']  # Low-frequency (semantic content)
+            lh = subbands['lh']  # Horizontal edges
+            hl = subbands['hl']  # Vertical edges
+            hh = subbands['hh']  # Diagonal edges
 
-            # 3. Apply frequency-specific attention with residual blocks
-            # Low-freq attention with instance normalization for color invariance
-            ll_enhanced = low_att(ll_proj)
+            # Step 2: Apply frequency-specific attention
+            # Low-freq: instance norm for illumination invariance
+            ll_attended = low_att(ll)
 
-            # High-freq attention for texture/edge features
-            lh_enhanced = high_att(lh_proj)
-            hl_enhanced = high_att(hl_proj)
-            hh_enhanced = high_att(hh_proj)
+            # High-freq: residual blocks + dilated convs for texture/edges
+            lh_attended = high_att(lh)
+            hl_attended = high_att(hl)
+            hh_attended = high_att(hh)
 
-            # 4. Combine high-frequency components for ODE processing
-            high_freq_combined = lh_enhanced + hl_enhanced + hh_enhanced
+            # Step 3: Combine high-frequency components for edge reconstruction
+            high_freq_combined = lh_attended + hl_attended + hh_attended
 
-            # 5. ODE-based edge reconstruction with 2nd-order RK2 solver
-            # Learnable alpha/beta parameters + Hamiltonian-inspired stability
-            edges_reconstructed = ode_recon(high_freq_combined)
+            # Step 4: ODE-based edge reconstruction with RK2 solver
+            # This refines and stabilizes edge features
+            edges_reconstructed = ode_module(high_freq_combined)
 
-            # 6. Fuse all frequency components (low + high + reconstructed edges)
-            freq_fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, edges_reconstructed], dim=1)
-            freq_fused = fusion(freq_fused)
+            # Step 5: Aggregate all frequency components
+            # Concatenate: [LL, LH, HL, reconstructed_edges]
+            freq_aggregated = torch.cat([
+                ll_attended,
+                lh_attended,
+                hl_attended,
+                edges_reconstructed
+            ], dim=1)
+
+            # Fuse into unified representation
+            freq_fused = fusion(freq_aggregated)
+
+            # Add residual connection for gradient flow
+            freq_fused = freq_fused + feat
 
             enhanced_features.append(freq_fused)
 
-        # Target size for fusion (use second highest resolution)
-        target_size = features[1].shape[2:]  # [H, W]
-
-        # Resize all enhanced features to target size (they're already 64 channels)
-        resized_features = []
-        for feat in enhanced_features:
-            # Resize to target size if needed
-            if feat.shape[2:] != target_size:
-                feat = F.interpolate(
-                    feat, size=target_size,
-                    mode='bilinear', align_corners=False
-                )
-            resized_features.append(feat)
-
-        # Fuse multi-scale frequency features
-        fused = torch.cat(resized_features, dim=1)  # [B, 64*4, H, W]
-        fused = self.fusion(fused)  # [B, 64, H, W]
-
-        # Upsample to match input resolution (dynamic, not hardcoded)
-        # Input features[0] is [B, C, H, W], output should be [B, 1, H*4, W*4]
-        output_size = (features[0].shape[2] * 4, features[0].shape[3] * 4)
-        fused = F.interpolate(fused, size=output_size, mode='bilinear', align_corners=False)
-
-        # Main prediction
-        pred = self.pred_head(fused)
+        # Step 6: Decode with deep supervision
+        # Returns main prediction [B, 1, 448, 448] + 3 auxiliary outputs
+        output = self.decoder(enhanced_features, return_aux=return_aux)
 
         if return_aux:
-            # Generate auxiliary predictions from original features (not enhanced)
-            aux_outputs = []
-            for i, (feat, aux_head) in enumerate(zip(features[1:], self.aux_heads)):
-                aux_pred = aux_head(feat)
-                # Upsample aux to match output size (not hardcoded 448)
-                aux_pred = F.interpolate(aux_pred, size=output_size, mode='bilinear', align_corners=False)
-                aux_outputs.append(aux_pred)
-
+            pred, aux_outputs = output
             return pred, aux_outputs
-
-        # Return tuple even when aux not requested (for MoE compatibility)
-        return pred, []
+        else:
+            pred = output
+            return pred, []  # MoE compatibility
 
 
 def count_parameters(model):
