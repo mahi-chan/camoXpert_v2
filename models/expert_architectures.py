@@ -506,18 +506,18 @@ class UJSCExpert(nn.Module):
 
 class FEDERFrequencyExpert(nn.Module):
     """
-    FEDER: Frequency Expert with Dynamic Edge Reconstruction
+    FEDER: Frequency Expert with Dynamic Edge Reconstruction (Lightweight)
 
     Core Innovation:
     - Deep Wavelet Decomposition: Learnable Haar wavelets for frequency separation
     - Dual Attention: Separate processing for high-freq (edges) and low-freq (semantics)
-    - ODE Edge Reconstruction: 2nd-order RK solver for boundary refinement
+    - Shared frequency processing across scales for efficiency
     - Multi-Scale Integration: Processes all PVT scales [64, 128, 320, 512]
 
     This expert excels at:
     - Detecting camouflaged objects with subtle texture differences
     - Precise boundary localization through frequency-domain analysis
-    - Adaptive edge enhancement via ODE-based evolution
+    - Efficient frequency-domain processing
 
     DataParallel Compatible: All components support multi-GPU training
     """
@@ -526,12 +526,41 @@ class FEDERFrequencyExpert(nn.Module):
 
         self.feature_dims = feature_dims
 
-        # Multi-scale frequency expert (processes all scales)
-        self.freq_expert = MultiScaleFrequencyExpert(
-            in_channels=feature_dims,
-            reduction=reduction,
-            ode_steps=ode_steps
+        # Lightweight frequency processing for each scale
+        # Use shared components to reduce parameters
+        from models.frequency_expert import (
+            DeepWaveletDecomposition,
+            HighFrequencyAttention,
+            LowFrequencyAttention
         )
+
+        # Scale-specific wavelet decomposition (lightweight, depthwise)
+        self.wavelet_decomps = nn.ModuleList([
+            DeepWaveletDecomposition(dim, learnable=True)
+            for dim in feature_dims
+        ])
+
+        # Shared frequency attention modules (reused across scales)
+        self.high_freq_att = HighFrequencyAttention(64, reduction)
+        self.low_freq_att = LowFrequencyAttention(64, reduction=4)
+
+        # Scale adapters to project to common dimension (64)
+        self.scale_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, 64, 1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Frequency fusion for each scale
+        self.freq_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(64 * 4, 64, 3, padding=1, bias=False),  # 4 subbands
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            ) for _ in feature_dims
+        ])
 
         # Feature aggregation across scales
         # Progressive upsampling from finest to coarsest
@@ -575,7 +604,7 @@ class FEDERFrequencyExpert(nn.Module):
 
     def forward(self, features, return_aux=False):
         """
-        Forward pass through FEDER expert.
+        Forward pass through lightweight FEDER expert.
 
         Args:
             features: List of 4 feature tensors [f1, f2, f3, f4]
@@ -586,11 +615,38 @@ class FEDERFrequencyExpert(nn.Module):
             pred: Main prediction [B, 1, 448, 448]
             aux_outputs: List of auxiliary predictions (if return_aux=True)
         """
-        # Apply frequency expert to all scales
-        enhanced_features, aux_dict = self.freq_expert(features, return_aux=True)
+        enhanced_features = []
+
+        # Process each scale with frequency decomposition
+        for i, (feat, wavelet, adapter, fusion) in enumerate(
+            zip(features, self.wavelet_decomps, self.scale_adapters, self.freq_fusion)
+        ):
+            # 1. Wavelet decomposition into 4 subbands
+            subbands = wavelet(feat)  # {ll, lh, hl, hh}
+
+            # 2. Project each subband to common dimension (64)
+            ll_proj = adapter(subbands['ll'])
+            lh_proj = adapter(subbands['lh'])
+            hl_proj = adapter(subbands['hl'])
+            hh_proj = adapter(subbands['hh'])
+
+            # 3. Apply frequency-specific attention
+            # Low-freq attention on LL subband
+            ll_enhanced = self.low_freq_att(ll_proj)
+
+            # High-freq attention on LH, HL, HH subbands
+            lh_enhanced = self.high_freq_att(lh_proj)
+            hl_enhanced = self.high_freq_att(hl_proj)
+            hh_enhanced = self.high_freq_att(hh_proj)
+
+            # 4. Fuse frequency components
+            freq_fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, hh_enhanced], dim=1)
+            freq_fused = fusion(freq_fused)
+
+            enhanced_features.append(freq_fused)
 
         # Target size for fusion (use second highest resolution)
-        target_size = enhanced_features[1].shape[2:]  # [H, W]
+        target_size = features[1].shape[2:]  # [H, W]
 
         # Aggregate and resize all features to target size
         aggregated = []
@@ -617,9 +673,9 @@ class FEDERFrequencyExpert(nn.Module):
         pred = self.pred_head(fused)
 
         if return_aux:
-            # Generate auxiliary predictions from enhanced features
+            # Generate auxiliary predictions from original features (not enhanced)
             aux_outputs = []
-            for i, (feat, aux_head) in enumerate(zip(enhanced_features[1:], self.aux_heads)):
+            for i, (feat, aux_head) in enumerate(zip(features[1:], self.aux_heads)):
                 aux_pred = aux_head(feat)
                 # Upsample to 448x448
                 aux_pred = F.interpolate(aux_pred, size=(448, 448), mode='bilinear', align_corners=False)
@@ -627,7 +683,8 @@ class FEDERFrequencyExpert(nn.Module):
 
             return pred, aux_outputs
 
-        return pred
+        # Return tuple even when aux not requested (for MoE compatibility)
+        return pred, []
 
 
 def count_parameters(model):
