@@ -322,7 +322,9 @@ class PartialDecoderComponent(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
 
-        # Reduce channels
+        self.out_channels = out_channels
+
+        # Reduce channels for high-level input
         self.reduce = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1),
             nn.BatchNorm2d(out_channels),
@@ -343,26 +345,25 @@ class PartialDecoderComponent(nn.Module):
         """
         Args:
             high_level: Higher-level features (coarser) - from current scale
-            low_level: Lower-level features (finer) - from previous PDC output
+            low_level: Lower-level features (finer) - from previous PDC (already at out_channels)
         Returns:
-            Refined features
+            Refined features at out_channels dimension
         """
-        # Reduce high-level channels
+        # Reduce high-level channels to out_channels
         high = self.reduce(high_level)
 
         # If low-level features provided, fuse them
         if low_level is not None:
-            # Upsample high to match low_level size
+            # Upsample high to match low_level spatial size
             h, w = low_level.shape[2:]
             high = F.interpolate(high, size=(h, w), mode='bilinear', align_corners=False)
 
-            # low_level is already at out_channels (from previous PDC)
-            # Just add directly (no reduction needed)
+            # Add features (low_level is already at out_channels from previous PDC)
             fused = high + low_level
         else:
             fused = high
 
-        # Refine
+        # Refine with convolutions
         refined = self.refine(fused)
 
         return refined
@@ -403,21 +404,23 @@ class SINetExpert(nn.Module):
         ])
 
         # Partial Decoder Components for progressive fusion
+        # All PDCs output 64 channels for consistent fusion
         # PDC4: f4 only (highest level)
         # PDC3: f4 + f3
         # PDC2: (f4+f3) + f2
         # PDC1: ((f4+f3)+f2) + f1
-        self.pdc4 = PartialDecoderComponent(feature_dims[3], 256)
-        self.pdc3 = PartialDecoderComponent(feature_dims[2], 256)
-        self.pdc2 = PartialDecoderComponent(feature_dims[1], 128)
-        self.pdc1 = PartialDecoderComponent(feature_dims[0], 64)
+        pdc_out_dim = 64
+        self.pdc4 = PartialDecoderComponent(feature_dims[3], pdc_out_dim)
+        self.pdc3 = PartialDecoderComponent(feature_dims[2], pdc_out_dim)
+        self.pdc2 = PartialDecoderComponent(feature_dims[1], pdc_out_dim)
+        self.pdc1 = PartialDecoderComponent(feature_dims[0], pdc_out_dim)
 
-        # Final prediction heads
-        self.pred_head4 = nn.Conv2d(256, 1, 1)
-        self.pred_head3 = nn.Conv2d(256, 1, 1)
-        self.pred_head2 = nn.Conv2d(128, 1, 1)
+        # Final prediction heads (all from 64 channels now)
+        self.pred_head4 = nn.Conv2d(pdc_out_dim, 1, 1)
+        self.pred_head3 = nn.Conv2d(pdc_out_dim, 1, 1)
+        self.pred_head2 = nn.Conv2d(pdc_out_dim, 1, 1)
         self.pred_head1 = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),
+            nn.Conv2d(pdc_out_dim, 32, 3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 1, 1)
