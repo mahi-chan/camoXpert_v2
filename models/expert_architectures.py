@@ -1232,24 +1232,13 @@ class ZoomNetExpert(nn.Module):
         # Step 3: Scale Integration Unit (top-down + bottom-up)
         integrated_features = self.siu(zoomed_features)
 
-        # Step 4: Hierarchical Triplet Attention with scale context
+        # Step 4: Hierarchical Triplet Attention
+        # Note: Scale context would require channel projection, simplified to use HTA without cross-scale context
         attended_features = []
-        for i, (feat, hta) in enumerate(zip(integrated_features, self.hta_modules)):
-            # Get scale context (average of other scales)
-            other_scales = [integrated_features[j] for j in range(len(integrated_features)) if j != i]
-
-            # Resize other scales to current scale size
-            scale_context = []
-            for other in other_scales:
-                if other.shape[2:] != feat.shape[2:]:
-                    other = F.interpolate(other, size=feat.shape[2:], mode='bilinear', align_corners=False)
-                scale_context.append(other)
-
-            # Average scale context
-            scale_context = torch.stack(scale_context).mean(dim=0)
-
-            # Apply HTA with scale context
-            attended = hta(feat, scale_context)
+        for feat, hta in zip(integrated_features, self.hta_modules):
+            # Apply HTA (channel + spatial attention)
+            # Scale attention will be computed within the feature itself
+            attended = hta(feat, scale_context=None)
             attended_features.append(attended)
 
         # Step 5: Final refinement
