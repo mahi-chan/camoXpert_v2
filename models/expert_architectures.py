@@ -342,25 +342,23 @@ class PartialDecoderComponent(nn.Module):
     def forward(self, high_level, low_level=None):
         """
         Args:
-            high_level: Higher-level features (coarser)
-            low_level: Lower-level features (finer), optional
+            high_level: Higher-level features (coarser) - from current scale
+            low_level: Lower-level features (finer) - from previous PDC output
         Returns:
             Refined features
         """
-        # Reduce channels
+        # Reduce high-level channels
         high = self.reduce(high_level)
 
         # If low-level features provided, fuse them
         if low_level is not None:
-            # Upsample high-level to match low-level size
+            # Upsample high to match low_level size
             h, w = low_level.shape[2:]
             high = F.interpolate(high, size=(h, w), mode='bilinear', align_corners=False)
 
-            # Reduce low-level channels
-            low = self.reduce(low_level)
-
-            # Add features
-            fused = high + low
+            # low_level is already at out_channels (from previous PDC)
+            # Just add directly (no reduction needed)
+            fused = high + low_level
         else:
             fused = high
 
