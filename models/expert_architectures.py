@@ -9,6 +9,7 @@ Core Concepts Implemented:
 - PraNet: Reverse Attention + Multi-scale RFB refinement
 - ZoomNet: Multi-kernel zoom (details + context) + aggregation
 - UJSC: Uncertainty-guided refinement + boundary enhancement
+- FEDER: Frequency Expert with Dynamic Edge Reconstruction
 
 All experts use deep supervision for better training.
 """
@@ -16,6 +17,7 @@ All experts use deep supervision for better training.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.frequency_expert import MultiScaleFrequencyExpert
 
 
 # ============================================================
@@ -497,6 +499,137 @@ class UJSCExpert(nn.Module):
         return pred, aux_outputs
 
 
+# ============================================================
+# EXPERT 5: FEDER (Frequency Expert with Dynamic Edge Reconstruction)
+# Core Concept: Frequency decomposition + ODE-based edge evolution
+# ============================================================
+
+class FEDERFrequencyExpert(nn.Module):
+    """
+    FEDER: Frequency Expert with Dynamic Edge Reconstruction
+
+    Core Innovation:
+    - Deep Wavelet Decomposition: Learnable Haar wavelets for frequency separation
+    - Dual Attention: Separate processing for high-freq (edges) and low-freq (semantics)
+    - ODE Edge Reconstruction: 2nd-order RK solver for boundary refinement
+    - Multi-Scale Integration: Processes all PVT scales [64, 128, 320, 512]
+
+    This expert excels at:
+    - Detecting camouflaged objects with subtle texture differences
+    - Precise boundary localization through frequency-domain analysis
+    - Adaptive edge enhancement via ODE-based evolution
+
+    DataParallel Compatible: All components support multi-GPU training
+    """
+    def __init__(self, feature_dims=[64, 128, 320, 512], reduction=16, ode_steps=2):
+        super().__init__()
+
+        self.feature_dims = feature_dims
+
+        # Multi-scale frequency expert (processes all scales)
+        self.freq_expert = MultiScaleFrequencyExpert(
+            in_channels=feature_dims,
+            reduction=reduction,
+            ode_steps=ode_steps
+        )
+
+        # Feature aggregation across scales
+        # Progressive upsampling from finest to coarsest
+        self.aggregation = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, 64, 1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True)
+            ) for dim in feature_dims
+        ])
+
+        # Fusion of multi-scale frequency features
+        self.fusion = nn.Sequential(
+            nn.Conv2d(64 * len(feature_dims), 128, 3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+        # Final prediction head
+        self.pred_head = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+            nn.Sigmoid()
+        )
+
+        # Deep supervision auxiliary heads (for each scale)
+        self.aux_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, dim // 2, 3, padding=1),
+                nn.BatchNorm2d(dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim // 2, 1, 1),
+                nn.Sigmoid()
+            ) for dim in feature_dims[1:]  # Skip lowest resolution
+        ])
+
+    def forward(self, features, return_aux=False):
+        """
+        Forward pass through FEDER expert.
+
+        Args:
+            features: List of 4 feature tensors [f1, f2, f3, f4]
+                      from PVT backbone with dims [64, 128, 320, 512]
+            return_aux: If True, return auxiliary predictions for deep supervision
+
+        Returns:
+            pred: Main prediction [B, 1, 448, 448]
+            aux_outputs: List of auxiliary predictions (if return_aux=True)
+        """
+        # Apply frequency expert to all scales
+        enhanced_features, aux_dict = self.freq_expert(features, return_aux=True)
+
+        # Target size for fusion (use second highest resolution)
+        target_size = enhanced_features[1].shape[2:]  # [H, W]
+
+        # Aggregate and resize all features to target size
+        aggregated = []
+        for i, (feat, agg) in enumerate(zip(enhanced_features, self.aggregation)):
+            feat_agg = agg(feat)
+
+            # Resize to target size
+            if feat_agg.shape[2:] != target_size:
+                feat_agg = F.interpolate(
+                    feat_agg, size=target_size,
+                    mode='bilinear', align_corners=False
+                )
+
+            aggregated.append(feat_agg)
+
+        # Fuse multi-scale frequency features
+        fused = torch.cat(aggregated, dim=1)
+        fused = self.fusion(fused)
+
+        # Upsample to final resolution (448x448)
+        fused = F.interpolate(fused, size=(448, 448), mode='bilinear', align_corners=False)
+
+        # Main prediction
+        pred = self.pred_head(fused)
+
+        if return_aux:
+            # Generate auxiliary predictions from enhanced features
+            aux_outputs = []
+            for i, (feat, aux_head) in enumerate(zip(enhanced_features[1:], self.aux_heads)):
+                aux_pred = aux_head(feat)
+                # Upsample to 448x448
+                aux_pred = F.interpolate(aux_pred, size=(448, 448), mode='bilinear', align_corners=False)
+                aux_outputs.append(aux_pred)
+
+            return pred, aux_outputs
+
+        return pred
+
+
 def count_parameters(model):
     """Count trainable parameters"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -518,7 +651,8 @@ if __name__ == '__main__':
         ("SINet-Inspired", SINetExpert()),
         ("PraNet-Inspired", PraNetExpert()),
         ("ZoomNet-Inspired", ZoomNetExpert()),
-        ("UJSC-Inspired", UJSCExpert())
+        ("UJSC-Inspired", UJSCExpert()),
+        ("FEDER (Frequency Expert)", FEDERFrequencyExpert())
     ]
 
     for name, expert in experts:
@@ -538,4 +672,5 @@ if __name__ == '__main__':
     print("  SINet: Search→Identify + RFB at ALL scales")
     print("  PraNet: Reverse Attention + RFB at ALL scales + Edge guidance")
     print("  ZoomNet: Multi-kernel zoom (3x3, 5x5, 7x7) + RFB")
+    print("  FEDER: Frequency decomposition + ODE edge reconstruction + Dual attention")
     print("  UJSC: Uncertainty-guided refinement + Boundary enhancement")
