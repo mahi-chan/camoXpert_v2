@@ -1,163 +1,196 @@
 """
-FrequencyExpert: FEDER-inspired frequency-domain architecture for camouflaged object detection
+Production-Ready FrequencyExpert for Camouflaged Object Detection
 
-This module implements a sophisticated frequency-based expert that decomposes features into
-high-frequency (texture/edge) and low-frequency (color/illumination) components, processes
-them with specialized attention mechanisms, and reconstructs edges using ODE-inspired dynamics.
+This module implements a frequency-domain expert architecture with:
+1. DeepWaveletDecomposition - Learnable Haar wavelets for frequency separation
+2. HighFrequencyAttention - Texture and edge enhancement
+3. LowFrequencyAttention - Semantic content processing
+4. ODEEdgeReconstruction - Second-order Runge-Kutta edge evolution
+5. Multi-scale integration for PVT backbone features [64, 128, 320, 512]
+6. Deep supervision with auxiliary outputs
 
-Components:
-1. Deep Wavelet-like Decomposition (DWD): Learnable wavelets initialized with Haar transforms
-2. High-Frequency Attention: Residual blocks with joint spatial-channel attention
-3. Low-Frequency Attention: Instance + positional normalization for redundancy suppression
-4. ODE-Inspired Edge Reconstruction: Second-order Runge-Kutta with Hamiltonian stability
-5. Guidance-Based Feature Aggregation: Attention-guided linear combinations
+Author: CamoXpert Team
+Compatible with: PyTorch 2.0+, PVT-v2 backbones
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List, Tuple, Dict
-from models.backbone import LayerNorm2d
+from typing import List, Tuple, Dict, Optional
 
 
-class LearnableWaveletDecomposition(nn.Module):
+# ============================================================================
+# Helper Modules
+# ============================================================================
+
+class LayerNorm2d(nn.Module):
     """
-    Deep Wavelet-like Decomposition (DWD) using learnable wavelets initialized with Haar transforms.
+    Layer Normalization for 2D feature maps (channels-first format).
 
-    Decomposes input into 4 subbands: LL (low-low), LH (low-high), HL (high-low), HH (high-high)
+    Normalizes over the channel dimension while preserving spatial structure.
     """
-    def __init__(self, channels):
+    def __init__(self, channels, eps=1e-6):
         super().__init__()
-        self.channels = channels
-
-        # Initialize with Haar wavelet basis
-        # LL: Low-pass in both directions (approximation)
-        # LH: Low-pass horizontal, High-pass vertical (horizontal details)
-        # HL: High-pass horizontal, Low-pass vertical (vertical details)
-        # HH: High-pass in both directions (diagonal details)
-
-        # Learnable wavelet filters (initialized with Haar)
-        self.ll_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.lh_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.hl_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.hh_conv = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
-
-        self._init_haar_wavelets()
-
-    def _init_haar_wavelets(self):
-        """Initialize convolution kernels with Haar wavelet basis"""
-        # Haar wavelet patterns (3x3 approximation)
-        # LL: averaging (low-pass)
-        ll_kernel = torch.ones(3, 3) / 9.0
-
-        # LH: horizontal edges (vertical high-pass)
-        lh_kernel = torch.tensor([
-            [-1, -1, -1],
-            [ 0,  0,  0],
-            [ 1,  1,  1]
-        ], dtype=torch.float32) / 6.0
-
-        # HL: vertical edges (horizontal high-pass)
-        hl_kernel = torch.tensor([
-            [-1,  0,  1],
-            [-1,  0,  1],
-            [-1,  0,  1]
-        ], dtype=torch.float32) / 6.0
-
-        # HH: diagonal edges (high-pass in both)
-        hh_kernel = torch.tensor([
-            [-1,  0,  1],
-            [ 0,  0,  0],
-            [ 1,  0, -1]
-        ], dtype=torch.float32) / 4.0
-
-        # Apply to all channels
-        for conv, kernel in zip(
-            [self.ll_conv, self.lh_conv, self.hl_conv, self.hh_conv],
-            [ll_kernel, lh_kernel, hl_kernel, hh_kernel]
-        ):
-            for i in range(self.channels):
-                conv.weight.data[i, i] = kernel
+        self.norm = nn.LayerNorm(channels, eps=eps)
 
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, C, H, W]
-        Returns:
-            Dictionary containing 4 subbands:
-                - ll: Low-frequency approximation [B, C, H, W]
-                - lh: Horizontal details [B, C, H, W]
-                - hl: Vertical details [B, C, H, W]
-                - hh: Diagonal details [B, C, H, W]
-        """
-        ll = self.ll_conv(x)  # Low-frequency (approximation)
-        lh = self.lh_conv(x)  # Horizontal edges
-        hl = self.hl_conv(x)  # Vertical edges
-        hh = self.hh_conv(x)  # Diagonal edges
-
-        return {
-            'll': ll,  # Low-frequency component
-            'lh': lh,  # High-frequency component (horizontal)
-            'hl': hl,  # High-frequency component (vertical)
-            'hh': hh   # High-frequency component (diagonal)
-        }
+        # x: [B, C, H, W]
+        x = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)  # [B, C, H, W]
+        return x
 
 
-class SpatialChannelAttention(nn.Module):
+class ChannelAttention(nn.Module):
     """
-    Joint Spatial-Channel Attention for high-frequency features.
-
-    Combines spatial attention (where to focus) with channel attention (what to focus on)
+    Channel attention module using global pooling and squeeze-excitation.
     """
     def __init__(self, channels, reduction=16):
         super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        # Channel attention
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+        self.fc = nn.Sequential(
             nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False),
-            nn.Sigmoid()
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
         )
-
-        # Spatial attention
-        self.spatial_attention = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            LayerNorm2d(channels // reduction),
-            nn.GELU(),
-            nn.Conv2d(channels // reduction, 1, 3, padding=1, bias=False),
-            nn.Sigmoid()
-        )
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        return self.sigmoid(avg_out + max_out)
+
+
+class SpatialAttention(nn.Module):
+    """
+    Spatial attention module using channel pooling and convolution.
+    """
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        return self.sigmoid(self.conv(out))
+
+
+# ============================================================================
+# Core Frequency Components
+# ============================================================================
+
+class DeepWaveletDecomposition(nn.Module):
+    """
+    Deep Wavelet Decomposition using learnable Haar wavelets.
+
+    Decomposes input into 4 frequency subbands:
+    - LL: Low-low (approximation, semantic content)
+    - LH: Low-high (horizontal edges)
+    - HL: High-low (vertical edges)
+    - HH: High-high (diagonal edges)
+
+    Args:
+        channels: Number of input channels
+        learnable: If True, wavelet filters are learnable (default: True)
+    """
+    def __init__(self, channels: int, learnable: bool = True):
+        super().__init__()
+        self.channels = channels
+        self.learnable = learnable
+
+        # Learnable wavelet filters initialized with Haar basis
+        self.ll_conv = nn.Conv2d(channels, channels, 3, stride=1, padding=1,
+                                 bias=False, groups=channels)
+        self.lh_conv = nn.Conv2d(channels, channels, 3, stride=1, padding=1,
+                                 bias=False, groups=channels)
+        self.hl_conv = nn.Conv2d(channels, channels, 3, stride=1, padding=1,
+                                 bias=False, groups=channels)
+        self.hh_conv = nn.Conv2d(channels, channels, 3, stride=1, padding=1,
+                                 bias=False, groups=channels)
+
+        # Initialize with Haar wavelet patterns
+        self._initialize_haar_wavelets()
+
+        # Optional: Make wavelets non-learnable
+        if not learnable:
+            for conv in [self.ll_conv, self.lh_conv, self.hl_conv, self.hh_conv]:
+                conv.weight.requires_grad = False
+
+    def _initialize_haar_wavelets(self):
+        """Initialize convolution kernels with Haar wavelet basis."""
+        # Define 3x3 Haar-like wavelet patterns
+        # LL: Low-pass (averaging)
+        ll_kernel = torch.ones(3, 3) / 9.0
+
+        # LH: Horizontal edges (vertical high-pass)
+        lh_kernel = torch.tensor([
+            [-1.0, -1.0, -1.0],
+            [ 0.0,  0.0,  0.0],
+            [ 1.0,  1.0,  1.0]
+        ]) / 6.0
+
+        # HL: Vertical edges (horizontal high-pass)
+        hl_kernel = torch.tensor([
+            [-1.0,  0.0,  1.0],
+            [-1.0,  0.0,  1.0],
+            [-1.0,  0.0,  1.0]
+        ]) / 6.0
+
+        # HH: Diagonal edges (both high-pass)
+        hh_kernel = torch.tensor([
+            [-1.0,  0.0,  1.0],
+            [ 0.0,  0.0,  0.0],
+            [ 1.0,  0.0, -1.0]
+        ]) / 4.0
+
+        # Apply kernels to all channels (depthwise)
+        kernels = [ll_kernel, lh_kernel, hl_kernel, hh_kernel]
+        convs = [self.ll_conv, self.lh_conv, self.hl_conv, self.hh_conv]
+
+        for conv, kernel in zip(convs, kernels):
+            # Initialize each channel with the same kernel (depthwise)
+            for i in range(self.channels):
+                conv.weight.data[i, 0] = kernel
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
+        Decompose input into frequency subbands.
+
         Args:
             x: Input tensor [B, C, H, W]
+
         Returns:
-            Attention-weighted features [B, C, H, W]
+            Dictionary with keys 'll', 'lh', 'hl', 'hh' containing subbands
         """
-        # Channel attention: B, C, H, W -> B, C, 1, 1 -> B, C, 1, 1
-        ca = self.channel_attention(x)
-
-        # Spatial attention: B, C, H, W -> B, 1, H, W
-        sa = self.spatial_attention(x)
-
-        # Joint attention
-        return x * ca * sa
+        return {
+            'll': self.ll_conv(x),  # Low-frequency approximation
+            'lh': self.lh_conv(x),  # Horizontal details
+            'hl': self.hl_conv(x),  # Vertical details
+            'hh': self.hh_conv(x)   # Diagonal details
+        }
 
 
 class HighFrequencyAttention(nn.Module):
     """
-    High-Frequency Attention module using residual blocks with joint spatial-channel attention
-    for texture-rich regions.
+    High-Frequency Attention for texture and edge enhancement.
+
+    Uses residual blocks with joint spatial-channel attention to enhance
+    high-frequency details (edges, textures) while suppressing noise.
+
+    Args:
+        channels: Number of input channels
+        reduction: Channel reduction ratio for attention (default: 16)
     """
-    def __init__(self, channels):
+    def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
 
-        # Residual block 1
-        self.res_block1 = nn.Sequential(
+        # Residual feature extraction blocks
+        self.conv1 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             LayerNorm2d(channels),
             nn.GELU(),
@@ -165,8 +198,7 @@ class HighFrequencyAttention(nn.Module):
             LayerNorm2d(channels)
         )
 
-        # Residual block 2
-        self.res_block2 = nn.Sequential(
+        self.conv2 = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             LayerNorm2d(channels),
             nn.GELU(),
@@ -175,76 +207,61 @@ class HighFrequencyAttention(nn.Module):
         )
 
         # Joint spatial-channel attention
-        self.attention = SpatialChannelAttention(channels)
+        self.channel_att = ChannelAttention(channels, reduction)
+        self.spatial_att = SpatialAttention(kernel_size=7)
 
-        # Final activation
         self.gelu = nn.GELU()
 
-    def forward(self, high_freq_features):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Enhance high-frequency features.
+
         Args:
-            high_freq_features: High-frequency components [B, C, H, W]
+            x: High-frequency features [B, C, H, W]
+
         Returns:
             Enhanced high-frequency features [B, C, H, W]
         """
-        # First residual block
-        out = self.res_block1(high_freq_features) + high_freq_features
+        # Residual block 1
+        identity = x
+        out = self.conv1(x) + identity
         out = self.gelu(out)
 
-        # Second residual block
-        out = self.res_block2(out) + out
+        # Residual block 2
+        identity = out
+        out = self.conv2(out) + identity
         out = self.gelu(out)
 
         # Apply joint attention
-        out = self.attention(out)
+        ca = self.channel_att(out)
+        sa = self.spatial_att(out)
+        out = out * ca * sa
 
         return out
 
 
-class PositionalNormalization(nn.Module):
-    """
-    Positional Normalization: Normalizes features based on spatial position.
-
-    Helps suppress redundant low-frequency information by considering spatial context.
-    """
-    def __init__(self, channels, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        # Learnable scale and bias per position
-        self.gamma = nn.Parameter(torch.ones(1, channels, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, channels, 1, 1))
-
-    def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, C, H, W]
-        Returns:
-            Positionally normalized features [B, C, H, W]
-        """
-        # Compute statistics along channel dimension, preserving spatial structure
-        mean = x.mean(dim=1, keepdim=True)  # [B, 1, H, W]
-        var = x.var(dim=1, keepdim=True, unbiased=False)  # [B, 1, H, W]
-
-        # Normalize
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
-
-        # Apply learnable affine transformation
-        return self.gamma * x_norm + self.beta
-
-
 class LowFrequencyAttention(nn.Module):
     """
-    Low-Frequency Attention with instance normalization and positional normalization
-    to suppress redundancy in color/illumination components.
+    Low-Frequency Attention for semantic content processing.
+
+    Uses instance normalization and positional encoding to process low-frequency
+    components while suppressing redundant background information.
+
+    Args:
+        channels: Number of input channels
+        reduction: Channel reduction ratio (default: 4)
     """
-    def __init__(self, channels):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
 
-        # Instance normalization (normalizes each sample independently)
+        # Instance normalization to reduce color/illumination bias
         self.instance_norm = nn.InstanceNorm2d(channels, affine=True)
 
         # Positional normalization
-        self.positional_norm = PositionalNormalization(channels)
+        self.pos_norm = nn.Sequential(
+            nn.GroupNorm(num_groups=min(32, channels), num_channels=channels),
+            nn.GELU()
+        )
 
         # Feature refinement
         self.refine = nn.Sequential(
@@ -255,35 +272,37 @@ class LowFrequencyAttention(nn.Module):
             LayerNorm2d(channels)
         )
 
-        # Suppression gate (learns what to suppress)
+        # Suppression gate to reduce redundancy
         self.suppression_gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, 1),
+            nn.Conv2d(channels, channels // reduction, 1),
             nn.GELU(),
-            nn.Conv2d(channels // 4, channels, 1),
+            nn.Conv2d(channels // reduction, channels, 1),
             nn.Sigmoid()
         )
 
         self.gelu = nn.GELU()
 
-    def forward(self, low_freq_features):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Process low-frequency features.
+
         Args:
-            low_freq_features: Low-frequency components [B, C, H, W]
+            x: Low-frequency features [B, C, H, W]
+
         Returns:
-            Refined low-frequency features with suppressed redundancy [B, C, H, W]
+            Refined low-frequency features [B, C, H, W]
         """
-        # Instance normalization to remove instance-specific bias
-        out = self.instance_norm(low_freq_features)
+        # Normalize to reduce illumination/color bias
+        out = self.instance_norm(x)
+        out = self.pos_norm(out)
 
-        # Positional normalization to suppress spatial redundancy
-        out = self.positional_norm(out)
-
-        # Refine features
-        out = self.refine(out) + out
+        # Refine features with residual connection
+        identity = out
+        out = self.refine(out) + identity
         out = self.gelu(out)
 
-        # Apply suppression gate to reduce redundancy
+        # Apply suppression gate
         gate = self.suppression_gate(out)
         out = out * gate
 
@@ -292,18 +311,26 @@ class LowFrequencyAttention(nn.Module):
 
 class ODEEdgeReconstruction(nn.Module):
     """
-    ODE-Inspired Edge Reconstruction using second-order Runge-Kutta solver
-    with Hamiltonian stability guarantees.
+    ODE-based Edge Reconstruction using 2nd-order Runge-Kutta solver.
 
-    Models edge evolution as: dx/dt = f(x, t), solved with RK2 (Heun's method)
-    Hamiltonian H = E_kinetic + E_potential ensures energy conservation
+    Models edge evolution as an ODE: dx/dt = f(x, t)
+    Solved using RK2 (Heun's method) for numerical stability.
+
+    The dynamics function f(x, t) learns to evolve edge features toward
+    cleaner, more coherent edge maps.
+
+    Args:
+        channels: Number of input channels
+        num_steps: Number of ODE integration steps (default: 2)
+        dt: Time step size (default: 0.1)
     """
-    def __init__(self, channels):
+    def __init__(self, channels: int, num_steps: int = 2, dt: float = 0.1):
         super().__init__()
         self.channels = channels
+        self.num_steps = num_steps
 
         # Edge dynamics function f(x, t)
-        self.edge_dynamics = nn.Sequential(
+        self.dynamics_net = nn.Sequential(
             nn.Conv2d(channels, channels, 3, padding=1, bias=False),
             LayerNorm2d(channels),
             nn.GELU(),
@@ -311,174 +338,144 @@ class ODEEdgeReconstruction(nn.Module):
             LayerNorm2d(channels)
         )
 
-        # Hamiltonian potential energy term
-        self.potential_energy = nn.Sequential(
+        # Learnable time step (bounded to ensure stability)
+        self.dt = nn.Parameter(torch.tensor(dt))
+
+        # Damping factor for stability
+        self.damping = nn.Parameter(torch.tensor(0.1))
+
+        # Potential energy term (Hamiltonian formulation)
+        self.potential = nn.Sequential(
             nn.Conv2d(channels, channels, 1, bias=False),
             LayerNorm2d(channels),
             nn.GELU()
         )
 
-        # Stability constraint (learnable damping)
-        self.damping = nn.Parameter(torch.tensor(0.1))
-
-        # Time step (learnable)
-        self.dt = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, high_freq_features):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Reconstruct edges using RK2 ODE solver.
 
         Args:
-            high_freq_features: High-frequency edge information [B, C, H, W]
+            x: High-frequency edge features [B, C, H, W]
+
         Returns:
             Reconstructed edge features [B, C, H, W]
         """
+        # Ensure dt is positive and bounded
+        dt = torch.clamp(self.dt, 0.01, 0.5)
+
         # Initial state
-        x0 = high_freq_features
+        x_curr = x
 
-        # RK2 (Heun's method) - Second-order Runge-Kutta
-        # Step 1: Compute k1 = f(x0)
-        k1 = self.edge_dynamics(x0)
+        # RK2 integration steps
+        for _ in range(self.num_steps):
+            # Step 1: Compute k1 = f(x_n)
+            k1 = self.dynamics_net(x_curr)
 
-        # Step 2: Compute k2 = f(x0 + dt * k1)
-        x_temp = x0 + self.dt * k1
-        k2 = self.edge_dynamics(x_temp)
+            # Step 2: Compute k2 = f(x_n + dt * k1)
+            x_temp = x_curr + dt * k1
+            k2 = self.dynamics_net(x_temp)
 
-        # Step 3: Update x = x0 + dt/2 * (k1 + k2)
-        x_next = x0 + (self.dt / 2.0) * (k1 + k2)
+            # Step 3: Update x_{n+1} = x_n + dt/2 * (k1 + k2)
+            x_next = x_curr + (dt / 2.0) * (k1 + k2)
 
-        # Apply Hamiltonian stability: Add potential energy term
-        # H = T + V, where T (kinetic) is edge evolution, V (potential) is regularization
-        potential = self.potential_energy(x_next)
+            # Apply potential energy for Hamiltonian stability
+            potential_term = self.potential(x_next)
+            x_next = x_next + potential_term * torch.sigmoid(self.damping)
 
-        # Energy-conserving update with damping for stability
-        # x_stable = x_next - damping * grad(V)
-        x_stable = x_next + potential * torch.sigmoid(self.damping)
+            x_curr = x_next
 
-        return x_stable
+        return x_curr
 
 
-class GuidanceBasedAggregation(nn.Module):
-    """
-    Guidance-Based Feature Aggregation replacing concatenation with attention-guided
-    linear combinations.
-
-    Instead of concat([f1, f2, f3]), computes: α1*f1 + α2*f2 + α3*f3
-    where α_i are learned attention weights
-    """
-    def __init__(self, channels, num_inputs=4):
-        super().__init__()
-        self.num_inputs = num_inputs
-
-        # Attention guidance network
-        self.guidance_net = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels * num_inputs, channels, 1),
-            nn.GELU(),
-            nn.Conv2d(channels, num_inputs, 1),
-            nn.Softmax(dim=1)  # Normalize across inputs
-        )
-
-        # Feature-wise modulation
-        self.modulation = nn.Sequential(
-            nn.Conv2d(channels, channels, 1, bias=False),
-            LayerNorm2d(channels),
-            nn.GELU()
-        )
-
-    def forward(self, features_list):
-        """
-        Args:
-            features_list: List of feature tensors [f1, f2, f3, f4], each [B, C, H, W]
-        Returns:
-            Aggregated features [B, C, H, W]
-        """
-        # Concatenate for guidance computation
-        concat_features = torch.cat(features_list, dim=1)  # [B, C*num_inputs, H, W]
-
-        # Compute attention weights for each input
-        attention_weights = self.guidance_net(concat_features)  # [B, num_inputs, 1, 1]
-
-        # Weighted linear combination
-        aggregated = sum(
-            w[:, i:i+1, :, :] * f
-            for i, (w, f) in enumerate(zip([attention_weights] * self.num_inputs, features_list))
-        )
-
-        # Feature modulation
-        aggregated = self.modulation(aggregated)
-
-        return aggregated
-
+# ============================================================================
+# Main FrequencyExpert Architecture
+# ============================================================================
 
 class FrequencyExpert(nn.Module):
     """
-    FEDER-inspired FrequencyExpert for camouflaged object detection.
+    Complete Frequency Expert for Camouflaged Object Detection.
 
-    Processes features through frequency decomposition, specialized attention mechanisms,
-    ODE-based edge reconstruction, and guidance-based aggregation.
+    Processes features through frequency decomposition, specialized attention,
+    and ODE-based edge reconstruction to enhance camouflaged object detection.
 
-    Architecture:
+    Architecture Flow:
         Input [B, C, H, W]
             ↓
-        [Deep Wavelet Decomposition] → {LL, LH, HL, HH}
-            ↓
-        [Low-Freq Attention]   [High-Freq Attention] × 3
-            ↓                        ↓
+        [Wavelet Decomposition] → {LL, LH, HL, HH}
+            ↓                          ↓
+        [Low-Freq Attention]    [High-Freq Attention] × 3
+            ↓                          ↓
         [ODE Edge Reconstruction]
             ↓
-        [Guidance-Based Aggregation]
+        [Feature Fusion]
             ↓
         Output [B, C, H, W] + Auxiliary Outputs
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
 
-        # 1. Deep Wavelet-like Decomposition
-        self.wavelet_decomposition = LearnableWaveletDecomposition(dim)
+    Args:
+        in_channels: Input feature channels
+        out_channels: Output feature channels (default: same as input)
+        reduction: Attention reduction ratio (default: 16)
+        ode_steps: ODE integration steps (default: 2)
+    """
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: Optional[int] = None,
+                 reduction: int = 16,
+                 ode_steps: int = 2):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels or in_channels
+
+        # 1. Wavelet Decomposition
+        self.wavelet_decomp = DeepWaveletDecomposition(in_channels, learnable=True)
 
         # 2. Low-Frequency Attention
-        self.low_freq_attention = LowFrequencyAttention(dim)
+        self.low_freq_att = LowFrequencyAttention(in_channels, reduction=4)
 
-        # 3. High-Frequency Attention (separate for each high-freq component)
-        self.high_freq_attention_lh = HighFrequencyAttention(dim)  # Horizontal
-        self.high_freq_attention_hl = HighFrequencyAttention(dim)  # Vertical
-        self.high_freq_attention_hh = HighFrequencyAttention(dim)  # Diagonal
+        # 3. High-Frequency Attention (separate for each subband)
+        self.high_freq_att_lh = HighFrequencyAttention(in_channels, reduction)
+        self.high_freq_att_hl = HighFrequencyAttention(in_channels, reduction)
+        self.high_freq_att_hh = HighFrequencyAttention(in_channels, reduction)
 
-        # 4. ODE-Inspired Edge Reconstruction
-        self.ode_edge_reconstruction = ODEEdgeReconstruction(dim)
+        # 4. ODE Edge Reconstruction
+        self.ode_edge_recon = ODEEdgeReconstruction(in_channels, num_steps=ode_steps)
 
-        # 5. Guidance-Based Feature Aggregation
-        self.feature_aggregation = GuidanceBasedAggregation(dim, num_inputs=4)
-
-        # 6. Deep supervision heads (auxiliary outputs)
-        self.aux_head_low = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, 3, padding=1),
-            LayerNorm2d(dim // 2),
+        # 5. Feature Fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 4, in_channels, 1, bias=False),
+            LayerNorm2d(in_channels),
             nn.GELU(),
-            nn.Conv2d(dim // 2, 1, 1)  # Single channel for segmentation
+            nn.Conv2d(in_channels, self.out_channels, 3, padding=1, bias=False),
+            LayerNorm2d(self.out_channels)
+        )
+
+        # 6. Deep Supervision Heads
+        self.aux_head_low = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, 1, 1),
+            nn.Sigmoid()
         )
 
         self.aux_head_high = nn.Sequential(
-            nn.Conv2d(dim, dim // 2, 3, padding=1),
-            LayerNorm2d(dim // 2),
-            nn.GELU(),
-            nn.Conv2d(dim // 2, 1, 1)  # Single channel for edge map
+            nn.Conv2d(in_channels, in_channels // 2, 3, padding=1),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels // 2, 1, 1),
+            nn.Sigmoid()
         )
 
         # Final refinement
-        self.final_refinement = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-            LayerNorm2d(dim),
-            nn.GELU(),
-            nn.Conv2d(dim, dim, 3, padding=1, bias=False),
-            LayerNorm2d(dim)
+        self.final_refine = nn.Sequential(
+            nn.Conv2d(self.out_channels, self.out_channels, 3, padding=1, bias=False),
+            LayerNorm2d(self.out_channels),
+            nn.GELU()
         )
 
-        self.gelu = nn.GELU()
-
-    def forward(self, x, return_aux=False):
+    def forward(self, x: torch.Tensor, return_aux: bool = False):
         """
         Forward pass through FrequencyExpert.
 
@@ -488,53 +485,52 @@ class FrequencyExpert(nn.Module):
 
         Returns:
             If return_aux=False:
-                Enhanced features [B, C, H, W]
+                Enhanced features [B, C_out, H, W]
             If return_aux=True:
-                (enhanced_features, aux_outputs) where aux_outputs is dict:
+                Tuple of (enhanced_features, aux_outputs) where aux_outputs contains:
                     - 'low_freq_pred': Low-frequency prediction [B, 1, H, W]
                     - 'high_freq_pred': High-frequency edge map [B, 1, H, W]
-                    - 'decomposition': Wavelet decomposition components
+                    - 'decomposition': Wavelet components dict
         """
-        # Step 1: Deep Wavelet-like Decomposition
-        decomposition = self.wavelet_decomposition(x)
-        ll = decomposition['ll']  # Low-frequency
-        lh = decomposition['lh']  # High-frequency (horizontal)
-        hl = decomposition['hl']  # High-frequency (vertical)
-        hh = decomposition['hh']  # High-frequency (diagonal)
+        # Step 1: Wavelet Decomposition
+        decomp = self.wavelet_decomp(x)
+        ll = decomp['ll']  # Low-frequency
+        lh = decomp['lh']  # Horizontal edges
+        hl = decomp['hl']  # Vertical edges
+        hh = decomp['hh']  # Diagonal edges
 
-        # Step 2: Low-Frequency Attention
-        low_freq_enhanced = self.low_freq_attention(ll)
+        # Step 2: Low-Frequency Processing
+        ll_enhanced = self.low_freq_att(ll)
 
-        # Step 3: High-Frequency Attention (for each component)
-        high_freq_lh = self.high_freq_attention_lh(lh)
-        high_freq_hl = self.high_freq_attention_hl(hl)
-        high_freq_hh = self.high_freq_attention_hh(hh)
+        # Step 3: High-Frequency Processing
+        lh_enhanced = self.high_freq_att_lh(lh)
+        hl_enhanced = self.high_freq_att_hl(hl)
+        hh_enhanced = self.high_freq_att_hh(hh)
 
         # Combine high-frequency components
-        high_freq_combined = high_freq_lh + high_freq_hl + high_freq_hh
+        high_freq_combined = lh_enhanced + hl_enhanced + hh_enhanced
 
-        # Step 4: ODE-Inspired Edge Reconstruction
-        edge_reconstructed = self.ode_edge_reconstruction(high_freq_combined)
+        # Step 4: ODE Edge Reconstruction
+        edges_reconstructed = self.ode_edge_recon(high_freq_combined)
 
-        # Step 5: Guidance-Based Feature Aggregation
-        features_to_aggregate = [
-            low_freq_enhanced,
-            high_freq_lh,
-            high_freq_hl,
-            edge_reconstructed
-        ]
-        aggregated = self.feature_aggregation(features_to_aggregate)
+        # Step 5: Feature Fusion
+        # Concatenate all frequency components
+        fused = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, edges_reconstructed], dim=1)
+        output = self.fusion(fused)
 
-        # Final refinement with residual connection
-        output = self.final_refinement(aggregated) + x
-        output = self.gelu(output)
+        # Add residual connection if dimensions match
+        if self.in_channels == self.out_channels:
+            output = output + x
 
-        # Auxiliary outputs for deep supervision
+        # Final refinement
+        output = self.final_refine(output)
+
+        # Generate auxiliary outputs for deep supervision
         if return_aux:
             aux_outputs = {
-                'low_freq_pred': self.aux_head_low(low_freq_enhanced),
-                'high_freq_pred': self.aux_head_high(edge_reconstructed),
-                'decomposition': decomposition
+                'low_freq_pred': self.aux_head_low(ll_enhanced),
+                'high_freq_pred': self.aux_head_high(edges_reconstructed),
+                'decomposition': decomp
             }
             return output, aux_outputs
 
@@ -543,60 +539,80 @@ class FrequencyExpert(nn.Module):
 
 class MultiScaleFrequencyExpert(nn.Module):
     """
-    Multi-scale FrequencyExpert that processes features at different scales.
+    Multi-Scale Frequency Expert for PVT backbone integration.
 
-    Designed to work with feature pyramids at dimensions [64, 128, 320, 512]
+    Processes features at multiple scales [64, 128, 320, 512] from PVT backbone
+    with separate FrequencyExpert modules for each scale.
+
+    Args:
+        in_channels: List of input channels for each scale [64, 128, 320, 512]
+        reduction: Attention reduction ratio (default: 16)
+        ode_steps: ODE integration steps (default: 2)
     """
-    def __init__(self, dims=[64, 128, 320, 512]):
+    def __init__(self,
+                 in_channels: List[int] = [64, 128, 320, 512],
+                 reduction: int = 16,
+                 ode_steps: int = 2):
         super().__init__()
-        self.dims = dims
 
-        # Create frequency expert for each scale
+        self.in_channels = in_channels
+        self.num_scales = len(in_channels)
+
+        # Create FrequencyExpert for each scale
         self.experts = nn.ModuleList([
-            FrequencyExpert(dim) for dim in dims
+            FrequencyExpert(ch, ch, reduction, ode_steps)
+            for ch in in_channels
         ])
 
         # Cross-scale feature fusion
         self.cross_scale_fusion = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim, 1),
-                LayerNorm2d(dim),
+                nn.Conv2d(ch, ch, 1, bias=False),
+                LayerNorm2d(ch),
                 nn.GELU()
-            ) for dim in dims
+            ) for ch in in_channels
         ])
 
-        # Deep supervision heads for each scale
-        self.deep_supervision_heads = nn.ModuleList([
+        # Deep supervision prediction heads
+        self.ds_heads = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim // 2, 3, padding=1),
-                LayerNorm2d(dim // 2),
-                nn.GELU(),
-                nn.Conv2d(dim // 2, 1, 1)
-            ) for dim in dims
+                nn.Conv2d(ch, ch // 2, 3, padding=1),
+                nn.BatchNorm2d(ch // 2),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(ch // 2, 1, 1),
+                nn.Sigmoid()
+            ) for ch in in_channels
         ])
 
-    def forward(self, features, return_aux=False):
+    def forward(self,
+                features: List[torch.Tensor],
+                return_aux: bool = False):
         """
-        Process multi-scale features.
+        Process multi-scale features from PVT backbone.
 
         Args:
-            features: List of feature tensors at different scales
-                      [f1, f2, f3, f4] with dims [64, 128, 320, 512]
-            return_aux: If True, return auxiliary predictions for deep supervision
+            features: List of feature tensors [f1, f2, f3, f4]
+                      with channels [64, 128, 320, 512]
+            return_aux: If True, return auxiliary predictions
 
         Returns:
             If return_aux=False:
-                List of enhanced features [f1', f2', f3', f4']
+                List of enhanced features
             If return_aux=True:
-                (enhanced_features, aux_predictions) where aux_predictions is list of
-                predictions at each scale for deep supervision
+                Tuple of (enhanced_features, aux_dict) where aux_dict contains:
+                    - 'predictions': Deep supervision predictions for each scale
+                    - 'aux_outputs': Auxiliary outputs from each expert
         """
+        assert len(features) == self.num_scales, \
+            f"Expected {self.num_scales} features, got {len(features)}"
+
         enhanced_features = []
         aux_predictions = []
         aux_outputs_all = []
 
         # Process each scale
         for i, (feat, expert) in enumerate(zip(features, self.experts)):
+            # Apply frequency expert
             if return_aux:
                 enhanced, aux = expert(feat, return_aux=True)
                 aux_outputs_all.append(aux)
@@ -609,44 +625,54 @@ class MultiScaleFrequencyExpert(nn.Module):
 
             # Generate deep supervision prediction
             if return_aux:
-                pred = self.deep_supervision_heads[i](enhanced)
+                pred = self.ds_heads[i](enhanced)
                 aux_predictions.append(pred)
 
         if return_aux:
-            return enhanced_features, {
+            aux_dict = {
                 'predictions': aux_predictions,
                 'aux_outputs': aux_outputs_all
             }
+            return enhanced_features, aux_dict
 
         return enhanced_features
 
 
-# Example usage and testing
-if __name__ == '__main__':
-    print("Testing FrequencyExpert...")
+# ============================================================================
+# Testing and Validation
+# ============================================================================
+
+def test_frequency_expert():
+    """Test FrequencyExpert with sample inputs."""
+    print("=" * 80)
+    print("Testing FrequencyExpert")
+    print("=" * 80)
 
     # Test single-scale expert
-    expert = FrequencyExpert(dim=128)
+    print("\n1. Testing single-scale FrequencyExpert...")
+    expert = FrequencyExpert(in_channels=128, reduction=16, ode_steps=2)
     x = torch.randn(2, 128, 32, 32)
 
-    # Forward pass without auxiliary outputs
-    output = expert(x)
-    print(f"Input shape: {x.shape}")
-    print(f"Output shape: {output.shape}")
-    assert output.shape == x.shape, "Shape mismatch!"
+    # Forward without aux
+    output = expert(x, return_aux=False)
+    print(f"   Input: {x.shape}")
+    print(f"   Output: {output.shape}")
+    assert output.shape == x.shape, "Output shape mismatch!"
 
-    # Forward pass with auxiliary outputs
+    # Forward with aux
     output, aux = expert(x, return_aux=True)
-    print(f"\nWith auxiliary outputs:")
-    print(f"  Low-freq prediction: {aux['low_freq_pred'].shape}")
-    print(f"  High-freq prediction: {aux['high_freq_pred'].shape}")
-    print(f"  Decomposition keys: {list(aux['decomposition'].keys())}")
+    print(f"   Low-freq prediction: {aux['low_freq_pred'].shape}")
+    print(f"   High-freq prediction: {aux['high_freq_pred'].shape}")
+    print(f"   Decomposition keys: {list(aux['decomposition'].keys())}")
 
     # Test multi-scale expert
-    print("\n" + "="*60)
-    print("Testing MultiScaleFrequencyExpert...")
+    print("\n2. Testing MultiScaleFrequencyExpert...")
+    multi_expert = MultiScaleFrequencyExpert(
+        in_channels=[64, 128, 320, 512],
+        reduction=16,
+        ode_steps=2
+    )
 
-    multi_expert = MultiScaleFrequencyExpert(dims=[64, 128, 320, 512])
     features = [
         torch.randn(2, 64, 64, 64),
         torch.randn(2, 128, 32, 32),
@@ -654,19 +680,27 @@ if __name__ == '__main__':
         torch.randn(2, 512, 8, 8)
     ]
 
-    # Forward pass
-    enhanced_features, aux = multi_expert(features, return_aux=True)
+    # Forward with aux
+    enhanced, aux_dict = multi_expert(features, return_aux=True)
 
-    print(f"\nEnhanced features:")
-    for i, feat in enumerate(enhanced_features):
-        print(f"  Scale {i}: {feat.shape}")
+    print(f"   Enhanced features:")
+    for i, feat in enumerate(enhanced):
+        print(f"      Scale {i} ({[64, 128, 320, 512][i]} ch): {feat.shape}")
 
-    print(f"\nDeep supervision predictions:")
-    for i, pred in enumerate(aux['predictions']):
-        print(f"  Scale {i}: {pred.shape}")
+    print(f"   Deep supervision predictions:")
+    for i, pred in enumerate(aux_dict['predictions']):
+        print(f"      Scale {i}: {pred.shape}")
 
     # Count parameters
     total_params = sum(p.numel() for p in multi_expert.parameters())
-    print(f"\nTotal parameters: {total_params:,}")
+    trainable_params = sum(p.numel() for p in multi_expert.parameters() if p.requires_grad)
+    print(f"\n   Total parameters: {total_params:,}")
+    print(f"   Trainable parameters: {trainable_params:,}")
+    print(f"   Memory (FP32): ~{total_params * 4 / 1024**2:.2f} MB")
 
     print("\n✓ All tests passed!")
+    print("=" * 80)
+
+
+if __name__ == '__main__':
+    test_frequency_expert()
