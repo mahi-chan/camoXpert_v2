@@ -114,6 +114,12 @@ def parse_args():
     parser.add_argument('--aug-transition-duration', type=int, default=50,
                         help='Epochs to ramp up augmentation strength (default: 50)')
 
+    # Router warmup (for MoE models)
+    parser.add_argument('--enable-router-warmup', action='store_true', default=True,
+                        help='Enable router warmup (freeze router for initial epochs)')
+    parser.add_argument('--router-warmup-epochs', type=int, default=15,
+                        help='Number of epochs to keep router frozen (default: 15)')
+
     # CompositeLoss settings
     parser.add_argument('--loss-scheme', type=str, default='progressive',
                         choices=['progressive', 'full'],
@@ -803,17 +809,17 @@ def main():
         if args.use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Router warmup: freeze router for first 15 epochs to stabilize expert learning
-        if args.num_experts > 1:
-            if epoch < 15:
+        # Router warmup: freeze router for initial epochs to stabilize expert learning
+        if args.num_experts > 1 and args.enable_router_warmup:
+            if epoch < args.router_warmup_epochs:
                 set_router_trainable(model, trainable=False)
                 if epoch == 0 and is_main_process:
-                    print("🔒 Router FROZEN for warmup (epochs 0-14)")
+                    print(f"🔒 Router FROZEN for warmup (epochs 0-{args.router_warmup_epochs-1})")
                     print("   Experts will learn independently before routing kicks in\n")
-            elif epoch == 15:
+            elif epoch == args.router_warmup_epochs:
                 set_router_trainable(model, trainable=True)
                 if is_main_process:
-                    print("🔓 Router UNFROZEN (epoch 15) - now learning routing patterns\n")
+                    print(f"🔓 Router UNFROZEN (epoch {args.router_warmup_epochs}) - now learning routing patterns\n")
 
         # Update CompositeLoss for current epoch
         criterion.update_epoch(epoch, args.epochs)

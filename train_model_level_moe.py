@@ -94,6 +94,12 @@ def parse_args():
     parser.add_argument('--load-experts-from', type=str, default=None,
                         help='For stage 2/3: path to trained experts')
 
+    # Router warmup (for Stage 3)
+    parser.add_argument('--enable-router-warmup', action='store_true', default=True,
+                        help='Enable router warmup in Stage 3 (freeze router for initial epochs)')
+    parser.add_argument('--router-warmup-epochs', type=int, default=15,
+                        help='Number of epochs to keep router frozen in Stage 3 (default: 15)')
+
     # System
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use-ddp', action='store_true', default=False)
@@ -481,8 +487,8 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
                 reduction='batchmean'
             )
 
-            # Total loss: segmentation + diversity
-            loss = (seg_loss + 0.01 * diversity_loss) / args.accumulation_steps
+            # Total loss: segmentation + diversity (increased from 0.01 to 0.1 for stronger diversity)
+            loss = (seg_loss + 0.1 * diversity_loss) / args.accumulation_steps
 
             # Backward (accumulate gradients)
             loss.backward()
@@ -591,16 +597,17 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
     # Training loop
     best_iou = 0.0
     for epoch in range(args.epochs):
-        # Router warmup: freeze router for first 15 epochs to stabilize expert learning
-        if epoch < 15:
-            set_router_trainable(model, trainable=False)
-            if epoch == 0 and is_main_process(args):
-                print("🔒 Router FROZEN for warmup (epochs 0-14)")
-                print("   Experts will stabilize before routing patterns are learned\n")
-        elif epoch == 15:
-            set_router_trainable(model, trainable=True)
-            if is_main_process(args):
-                print("🔓 Router UNFROZEN (epoch 15) - now learning routing patterns\n")
+        # Router warmup: freeze router for initial epochs to stabilize expert learning
+        if args.enable_router_warmup:
+            if epoch < args.router_warmup_epochs:
+                set_router_trainable(model, trainable=False)
+                if epoch == 0 and is_main_process(args):
+                    print(f"🔒 Router FROZEN for warmup (epochs 0-{args.router_warmup_epochs-1})")
+                    print("   Experts will stabilize before routing patterns are learned\n")
+            elif epoch == args.router_warmup_epochs:
+                set_router_trainable(model, trainable=True)
+                if is_main_process(args):
+                    print(f"🔓 Router UNFROZEN (epoch {args.router_warmup_epochs}) - now learning routing patterns\n")
 
         model.train()
         total_loss = 0
