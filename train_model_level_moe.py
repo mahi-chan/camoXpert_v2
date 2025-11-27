@@ -531,6 +531,23 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
                   f"IoU: {val_metrics['IoU']:.4f} | "
                   f"Entropy: {routing_stats.get('entropy', 0):.3f}")
 
+            # Print router health diagnostics
+            if routing_stats:
+                entropy = routing_stats.get('entropy', 0)
+                avg_probs = routing_stats.get('avg_expert_probs', [])
+
+                print(f"\n  Router Health:")
+                print(f"    Entropy: {entropy:.3f} (healthy: 1.0-1.6)")
+                if avg_probs:
+                    print(f"    Expert probs: {[f'{p:.2f}' for p in avg_probs]}")
+
+                if entropy < 0.5:
+                    print(f"    ⚠️  COLLAPSE DETECTED - Router using same experts for all images!")
+                elif entropy > 1.8:
+                    print(f"    ⚠️  NO LEARNING - Router selecting randomly!")
+                else:
+                    print(f"    ✓ Router is learning meaningful routing patterns")
+
             if val_metrics['IoU'] > best_iou:
                 best_iou = val_metrics['IoU']
                 print(f"🏆 NEW BEST! IoU: {best_iou:.4f}")
@@ -669,6 +686,23 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
             print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
                   f"IoU: {val_metrics['IoU']:.4f} | Dice: {val_metrics['Dice_Score']:.4f} | "
                   f"LR: {current_lr:.6f}")
+
+            # Print router health diagnostics
+            if routing_stats:
+                entropy = routing_stats.get('entropy', 0)
+                avg_probs = routing_stats.get('avg_expert_probs', [])
+
+                print(f"\n  Router Health:")
+                print(f"    Entropy: {entropy:.3f} (healthy: 1.0-1.6)")
+                if avg_probs:
+                    print(f"    Expert probs: {[f'{p:.2f}' for p in avg_probs]}")
+
+                if entropy < 0.5:
+                    print(f"    ⚠️  COLLAPSE DETECTED - Router using same experts for all images!")
+                elif entropy > 1.8:
+                    print(f"    ⚠️  NO LEARNING - Router selecting randomly!")
+                else:
+                    print(f"    ✓ Router is learning meaningful routing patterns")
 
             if val_metrics['IoU'] > best_iou:
                 best_iou = val_metrics['IoU']
