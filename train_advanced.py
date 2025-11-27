@@ -797,6 +797,16 @@ def main():
         start_epoch = trainer.load_checkpoint(args.resume_from)
         start_epoch += 1
 
+        # Restore best_smeasure from best_model.pth if it exists
+        best_model_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+        if os.path.exists(best_model_path):
+            best_checkpoint = torch.load(best_model_path, map_location=device)
+            if 'metrics' in best_checkpoint and 'val_s_measure' in best_checkpoint['metrics']:
+                best_smeasure = best_checkpoint['metrics']['val_s_measure']
+                if is_main_process:
+                    print(f"✅ Restored best S-measure: {best_smeasure:.4f}")
+            del best_checkpoint  # Free memory
+
     # Training loop
     if is_main_process:
         print("=" * 80)
