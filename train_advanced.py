@@ -464,15 +464,20 @@ def compute_metrics(predictions, targets):
     # Threshold predictions (predictions are already sigmoid'd in the model)
     preds_binary = (torch.sigmoid(predictions) > 0.5).float()
 
+    # Use continuous predictions for S-measure (more accurate)
+    preds_continuous = torch.sigmoid(predictions)
+
     # Compute metrics using correct method names
     mae = metrics.mae(preds_binary, targets)
-    iou = metrics.iou(preds_binary, targets)
+    s_measure = metrics.s_measure(preds_continuous, targets)  # PRIMARY METRIC
     f_measure = metrics.f_measure(preds_binary, targets)
+    iou = metrics.iou(preds_binary, targets)  # Secondary
 
     return {
         'val_mae': mae,
-        'val_iou': iou,
-        'val_f_measure': f_measure
+        'val_s_measure': s_measure,  # PRIMARY
+        'val_f_measure': f_measure,
+        'val_iou': iou  # Secondary
     }
 
 
@@ -753,7 +758,7 @@ def main():
 
     # Resume from checkpoint if specified
     start_epoch = 0
-    best_iou = 0.0
+    best_smeasure = 0.0
 
     if args.resume_from and os.path.exists(args.resume_from):
         if is_main_process:
@@ -805,9 +810,10 @@ def main():
             print(f"\nEpoch [{epoch}/{args.epochs}] Results:")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
             print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-            print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
+            print(f"  Val S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
             print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
             print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
+            print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
             print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
             # Boundary refinement metrics
@@ -832,13 +838,13 @@ def main():
 
         # Save checkpoints (main process only)
         if is_main_process:
-            # Save best model
-            current_iou = val_metrics['val_iou']
-            if current_iou > best_iou:
-                best_iou = current_iou
+            # Save best model based on S-measure (higher is better)
+            current_smeasure = val_metrics['val_s_measure']
+            if current_smeasure > best_smeasure:
+                best_smeasure = current_smeasure
                 best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
                 trainer.save_checkpoint(best_path, epoch, val_metrics)
-                print(f"✓ Saved best model (IoU: {best_iou:.4f})")
+                print(f"✓ Saved best model (S-measure: {best_smeasure:.4f})")
 
             # Save periodic checkpoint
             if (epoch + 1) % args.save_interval == 0:
@@ -855,7 +861,7 @@ def main():
         print("\n" + "=" * 80)
         print("Training completed!")
         print("=" * 80)
-        print(f"Best validation IoU: {best_iou:.4f}")
+        print(f"Best validation S-measure: {best_smeasure:.4f}")
         print(f"Checkpoints saved to: {args.checkpoint_dir}")
 
         summary = trainer.get_training_summary()
