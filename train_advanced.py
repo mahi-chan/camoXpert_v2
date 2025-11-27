@@ -104,11 +104,15 @@ def parse_args():
     parser.add_argument('--no-amp', action='store_false', dest='use_amp',
                         help='Disable AMP')
 
-    # Progressive augmentation
+    # Progressive augmentation (delayed for convergence)
     parser.add_argument('--enable-progressive-aug', action='store_true', default=True,
                         help='Enable progressive augmentation')
-    parser.add_argument('--aug-transition-epoch', type=int, default=20,
-                        help='Epoch to start increasing augmentation')
+    parser.add_argument('--aug-transition-epoch', type=int, default=50,
+                        help='Epoch to start increasing augmentation (default: 50, delayed for convergence)')
+    parser.add_argument('--aug-max-strength', type=float, default=0.5,
+                        help='Maximum augmentation strength (default: 0.5)')
+    parser.add_argument('--aug-transition-duration', type=int, default=50,
+                        help='Epochs to ramp up augmentation strength (default: 50)')
 
     # CompositeLoss settings
     parser.add_argument('--loss-scheme', type=str, default='progressive',
@@ -737,7 +741,9 @@ def main():
         enable_load_balancing=True if args.num_experts > 1 else False,
         enable_collapse_detection=True if args.num_experts > 1 else False,
         enable_progressive_aug=args.enable_progressive_aug,
-        aug_transition_epoch=args.aug_transition_epoch
+        aug_transition_epoch=args.aug_transition_epoch,
+        aug_max_strength=args.aug_max_strength,
+        aug_transition_duration=args.aug_transition_duration
     )
 
     # Store additional modules in trainer for access during training
