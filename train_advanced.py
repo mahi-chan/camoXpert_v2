@@ -800,7 +800,7 @@ def main():
         # Restore best_smeasure from best_model.pth if it exists
         best_model_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
         if os.path.exists(best_model_path):
-            best_checkpoint = torch.load(best_model_path, map_location=device)
+            best_checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
             if 'metrics' in best_checkpoint and 'val_s_measure' in best_checkpoint['metrics']:
                 best_smeasure = best_checkpoint['metrics']['val_s_measure']
                 if is_main_process:
