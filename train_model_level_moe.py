@@ -550,6 +550,21 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
     return best_iou
 
 
+def set_router_trainable(model, trainable):
+    """
+    Freeze or unfreeze router parameters.
+
+    Args:
+        model: The model (potentially wrapped in DDP)
+        trainable: Boolean - True to unfreeze, False to freeze
+    """
+    actual_model = get_model(model)
+
+    for name, param in actual_model.named_parameters():
+        if 'router' in name:
+            param.requires_grad = trainable
+
+
 def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, args):
     """Fine-tune full ensemble (Stage 3)"""
 
@@ -576,6 +591,17 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
     # Training loop
     best_iou = 0.0
     for epoch in range(args.epochs):
+        # Router warmup: freeze router for first 15 epochs to stabilize expert learning
+        if epoch < 15:
+            set_router_trainable(model, trainable=False)
+            if epoch == 0 and is_main_process(args):
+                print("🔒 Router FROZEN for warmup (epochs 0-14)")
+                print("   Experts will stabilize before routing patterns are learned\n")
+        elif epoch == 15:
+            set_router_trainable(model, trainable=True)
+            if is_main_process(args):
+                print("🔓 Router UNFROZEN (epoch 15) - now learning routing patterns\n")
+
         model.train()
         total_loss = 0
         num_batches = 0

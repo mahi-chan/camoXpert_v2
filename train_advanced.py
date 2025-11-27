@@ -461,6 +461,25 @@ def compute_additional_losses(args, multi_scale_processor, boundary_refinement,
     return total_additional_loss, loss_dict
 
 
+def set_router_trainable(model, trainable):
+    """
+    Freeze or unfreeze router parameters.
+
+    Args:
+        model: The model (potentially wrapped in DDP)
+        trainable: Boolean - True to unfreeze, False to freeze
+    """
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # Only applies to MoE models with router
+    if not hasattr(actual_model, 'router'):
+        return
+
+    for name, param in actual_model.named_parameters():
+        if 'router' in name:
+            param.requires_grad = trainable
+
+
 def compute_metrics(predictions, targets):
     """Compute validation metrics."""
     metrics = CODMetrics()
@@ -783,6 +802,18 @@ def main():
         # Set epoch for distributed sampler
         if args.use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
+        # Router warmup: freeze router for first 15 epochs to stabilize expert learning
+        if args.num_experts > 1:
+            if epoch < 15:
+                set_router_trainable(model, trainable=False)
+                if epoch == 0 and is_main_process:
+                    print("🔒 Router FROZEN for warmup (epochs 0-14)")
+                    print("   Experts will learn independently before routing kicks in\n")
+            elif epoch == 15:
+                set_router_trainable(model, trainable=True)
+                if is_main_process:
+                    print("🔓 Router UNFROZEN (epoch 15) - now learning routing patterns\n")
 
         # Update CompositeLoss for current epoch
         criterion.update_epoch(epoch, args.epochs)
