@@ -895,6 +895,14 @@ def main():
                 trainer.save_checkpoint(ckpt_path, epoch, val_metrics)
                 print(f"✓ Saved checkpoint: {ckpt_path}")
 
+                # Clean up old periodic checkpoints (keep only last 3)
+                import glob
+                periodic_ckpts = sorted(glob.glob(os.path.join(args.checkpoint_dir, 'epoch_*.pth')))
+                if len(periodic_ckpts) > 3:
+                    for old_ckpt in periodic_ckpts[:-3]:  # Keep only last 3
+                        os.remove(old_ckpt)
+                        print(f"  🗑️  Removed old checkpoint: {os.path.basename(old_ckpt)}")
+
             # Always save latest
             latest_path = os.path.join(args.checkpoint_dir, 'latest.pth')
             trainer.save_checkpoint(latest_path, epoch, val_metrics)
