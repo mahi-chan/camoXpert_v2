@@ -104,11 +104,21 @@ def parse_args():
     parser.add_argument('--no-amp', action='store_false', dest='use_amp',
                         help='Disable AMP')
 
-    # Progressive augmentation
+    # Progressive augmentation (delayed for convergence)
     parser.add_argument('--enable-progressive-aug', action='store_true', default=True,
                         help='Enable progressive augmentation')
-    parser.add_argument('--aug-transition-epoch', type=int, default=20,
-                        help='Epoch to start increasing augmentation')
+    parser.add_argument('--aug-transition-epoch', type=int, default=50,
+                        help='Epoch to start increasing augmentation (default: 50, delayed for convergence)')
+    parser.add_argument('--aug-max-strength', type=float, default=0.5,
+                        help='Maximum augmentation strength (default: 0.5)')
+    parser.add_argument('--aug-transition-duration', type=int, default=50,
+                        help='Epochs to ramp up augmentation strength (default: 50)')
+
+    # Router warmup (for MoE models)
+    parser.add_argument('--enable-router-warmup', action='store_true', default=True,
+                        help='Enable router warmup (freeze router for initial epochs)')
+    parser.add_argument('--router-warmup-epochs', type=int, default=15,
+                        help='Number of epochs to keep router frozen (default: 15)')
 
     # CompositeLoss settings
     parser.add_argument('--loss-scheme', type=str, default='progressive',
@@ -457,6 +467,25 @@ def compute_additional_losses(args, multi_scale_processor, boundary_refinement,
     return total_additional_loss, loss_dict
 
 
+def set_router_trainable(model, trainable):
+    """
+    Freeze or unfreeze router parameters.
+
+    Args:
+        model: The model (potentially wrapped in DDP)
+        trainable: Boolean - True to unfreeze, False to freeze
+    """
+    actual_model = model.module if hasattr(model, 'module') else model
+
+    # Only applies to MoE models with router
+    if not hasattr(actual_model, 'router'):
+        return
+
+    for name, param in actual_model.named_parameters():
+        if 'router' in name:
+            param.requires_grad = trainable
+
+
 def compute_metrics(predictions, targets):
     """Compute validation metrics."""
     metrics = CODMetrics()
@@ -464,15 +493,20 @@ def compute_metrics(predictions, targets):
     # Threshold predictions (predictions are already sigmoid'd in the model)
     preds_binary = (torch.sigmoid(predictions) > 0.5).float()
 
+    # Use continuous predictions for S-measure (more accurate)
+    preds_continuous = torch.sigmoid(predictions)
+
     # Compute metrics using correct method names
     mae = metrics.mae(preds_binary, targets)
-    iou = metrics.iou(preds_binary, targets)
+    s_measure = metrics.s_measure(preds_continuous, targets)  # PRIMARY METRIC
     f_measure = metrics.f_measure(preds_binary, targets)
+    iou = metrics.iou(preds_binary, targets)  # Secondary
 
     return {
         'val_mae': mae,
-        'val_iou': iou,
-        'val_f_measure': f_measure
+        'val_s_measure': s_measure,  # PRIMARY
+        'val_f_measure': f_measure,
+        'val_iou': iou  # Secondary
     }
 
 
@@ -732,7 +766,9 @@ def main():
         enable_load_balancing=True if args.num_experts > 1 else False,
         enable_collapse_detection=True if args.num_experts > 1 else False,
         enable_progressive_aug=args.enable_progressive_aug,
-        aug_transition_epoch=args.aug_transition_epoch
+        aug_transition_epoch=args.aug_transition_epoch,
+        aug_max_strength=args.aug_max_strength,
+        aug_transition_duration=args.aug_transition_duration
     )
 
     # Store additional modules in trainer for access during training
@@ -753,7 +789,7 @@ def main():
 
     # Resume from checkpoint if specified
     start_epoch = 0
-    best_iou = 0.0
+    best_smeasure = 0.0
 
     if args.resume_from and os.path.exists(args.resume_from):
         if is_main_process:
@@ -772,6 +808,18 @@ def main():
         # Set epoch for distributed sampler
         if args.use_ddp and train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
+        # Router warmup: freeze router for initial epochs to stabilize expert learning
+        if args.num_experts > 1 and args.enable_router_warmup:
+            if epoch < args.router_warmup_epochs:
+                set_router_trainable(model, trainable=False)
+                if epoch == 0 and is_main_process:
+                    print(f"🔒 Router FROZEN for warmup (epochs 0-{args.router_warmup_epochs-1})")
+                    print("   Experts will learn independently before routing kicks in\n")
+            elif epoch == args.router_warmup_epochs:
+                set_router_trainable(model, trainable=True)
+                if is_main_process:
+                    print(f"🔓 Router UNFROZEN (epoch {args.router_warmup_epochs}) - now learning routing patterns\n")
 
         # Update CompositeLoss for current epoch
         criterion.update_epoch(epoch, args.epochs)
@@ -805,9 +853,10 @@ def main():
             print(f"\nEpoch [{epoch}/{args.epochs}] Results:")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
             print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-            print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
+            print(f"  Val S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
             print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
             print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
+            print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
             print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
             # Boundary refinement metrics
@@ -832,13 +881,13 @@ def main():
 
         # Save checkpoints (main process only)
         if is_main_process:
-            # Save best model
-            current_iou = val_metrics['val_iou']
-            if current_iou > best_iou:
-                best_iou = current_iou
+            # Save best model based on S-measure (higher is better)
+            current_smeasure = val_metrics['val_s_measure']
+            if current_smeasure > best_smeasure:
+                best_smeasure = current_smeasure
                 best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
                 trainer.save_checkpoint(best_path, epoch, val_metrics)
-                print(f"✓ Saved best model (IoU: {best_iou:.4f})")
+                print(f"✓ Saved best model (S-measure: {best_smeasure:.4f})")
 
             # Save periodic checkpoint
             if (epoch + 1) % args.save_interval == 0:
@@ -855,7 +904,7 @@ def main():
         print("\n" + "=" * 80)
         print("Training completed!")
         print("=" * 80)
-        print(f"Best validation IoU: {best_iou:.4f}")
+        print(f"Best validation S-measure: {best_smeasure:.4f}")
         print(f"Checkpoints saved to: {args.checkpoint_dir}")
 
         summary = trainer.get_training_summary()

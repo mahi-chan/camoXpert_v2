@@ -7,7 +7,7 @@ Features:
 3. Global-batch load balancing for MoE synchronization
 4. Gradient accumulation for effective batch size increase
 5. Mixed precision training with automatic loss scaling
-6. Progressive augmentation (increases after epoch 20)
+6. Progressive augmentation (delayed start at epoch 50, max strength 0.5)
 7. COD-specific augmentations (Fourier mixing, contrastive, mirror disruption)
 """
 
@@ -341,7 +341,8 @@ class CODProgressiveAugmentation:
     """
     Progressive augmentation for camouflaged object detection.
 
-    Increases augmentation strength after epoch 20 to improve robustness.
+    Increases augmentation strength after epoch 50 to improve robustness.
+    Delayed start prevents interference with early convergence.
     Includes COD-specific augmentations:
     1. Fourier-based mixing: Mix images in frequency domain
     2. Contrastive learning: Generate positive/negative pairs
@@ -349,16 +350,16 @@ class CODProgressiveAugmentation:
 
     Args:
         initial_strength: Initial augmentation strength (default: 0.3)
-        max_strength: Maximum augmentation strength (default: 0.8)
-        transition_epoch: Epoch to start increasing strength (default: 20)
-        transition_duration: Epochs over which to ramp up (default: 10)
+        max_strength: Maximum augmentation strength (default: 0.5)
+        transition_epoch: Epoch to start increasing strength (default: 50)
+        transition_duration: Epochs over which to ramp up (default: 50)
     """
     def __init__(
         self,
         initial_strength: float = 0.3,
-        max_strength: float = 0.8,
-        transition_epoch: int = 20,
-        transition_duration: int = 10
+        max_strength: float = 0.5,
+        transition_epoch: int = 50,
+        transition_duration: int = 50
     ):
         self.initial_strength = initial_strength
         self.max_strength = max_strength
@@ -650,7 +651,7 @@ class OptimizedTrainer:
     3. Global-batch load balancing for MoE synchronization
     4. Gradient accumulation for effective batch size increase
     5. Mixed precision training with automatic loss scaling
-    6. Progressive augmentation (increases after epoch 20)
+    6. Progressive augmentation (increases after epoch 50, delayed for convergence)
     7. COD-specific augmentations
 
     Args:
@@ -668,7 +669,9 @@ class OptimizedTrainer:
         enable_load_balancing: Enable MoE load balancing (default: False)
         enable_collapse_detection: Enable expert collapse detection (default: False)
         enable_progressive_aug: Enable progressive augmentation (default: True)
-        aug_transition_epoch: Epoch to start increasing augmentation (default: 20)
+        aug_transition_epoch: Epoch to start increasing augmentation (default: 50)
+        aug_max_strength: Maximum augmentation strength (default: 0.5)
+        aug_transition_duration: Epochs to ramp up augmentation (default: 50)
     """
     def __init__(
         self,
@@ -686,7 +689,9 @@ class OptimizedTrainer:
         enable_load_balancing: bool = False,
         enable_collapse_detection: bool = False,
         enable_progressive_aug: bool = True,
-        aug_transition_epoch: int = 20
+        aug_transition_epoch: int = 50,
+        aug_max_strength: float = 0.5,
+        aug_transition_duration: int = 50
     ):
         self.model = model
         self.optimizer = optimizer
@@ -726,7 +731,9 @@ class OptimizedTrainer:
         self.enable_progressive_aug = enable_progressive_aug
         if enable_progressive_aug:
             self.augmentation = CODProgressiveAugmentation(
-                transition_epoch=aug_transition_epoch
+                transition_epoch=aug_transition_epoch,
+                max_strength=aug_max_strength,
+                transition_duration=aug_transition_duration
             )
         else:
             self.augmentation = None

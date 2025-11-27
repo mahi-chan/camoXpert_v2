@@ -94,6 +94,12 @@ def parse_args():
     parser.add_argument('--load-experts-from', type=str, default=None,
                         help='For stage 2/3: path to trained experts')
 
+    # Router warmup (for Stage 3)
+    parser.add_argument('--enable-router-warmup', action='store_true', default=True,
+                        help='Enable router warmup in Stage 3 (freeze router for initial epochs)')
+    parser.add_argument('--router-warmup-epochs', type=int, default=15,
+                        help='Number of epochs to keep router frozen in Stage 3 (default: 15)')
+
     # System
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--use-ddp', action='store_true', default=False)
@@ -481,8 +487,8 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
                 reduction='batchmean'
             )
 
-            # Total loss: segmentation + diversity
-            loss = (seg_loss + 0.01 * diversity_loss) / args.accumulation_steps
+            # Total loss: segmentation + diversity (increased from 0.01 to 0.1 for stronger diversity)
+            loss = (seg_loss + 0.1 * diversity_loss) / args.accumulation_steps
 
             # Backward (accumulate gradients)
             loss.backward()
@@ -525,6 +531,23 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
                   f"IoU: {val_metrics['IoU']:.4f} | "
                   f"Entropy: {routing_stats.get('entropy', 0):.3f}")
 
+            # Print router health diagnostics
+            if routing_stats:
+                entropy = routing_stats.get('entropy', 0)
+                avg_probs = routing_stats.get('avg_expert_probs', [])
+
+                print(f"\n  Router Health:")
+                print(f"    Entropy: {entropy:.3f} (healthy: 1.0-1.6)")
+                if avg_probs:
+                    print(f"    Expert probs: {[f'{p:.2f}' for p in avg_probs]}")
+
+                if entropy < 0.5:
+                    print(f"    ⚠️  COLLAPSE DETECTED - Router using same experts for all images!")
+                elif entropy > 1.8:
+                    print(f"    ⚠️  NO LEARNING - Router selecting randomly!")
+                else:
+                    print(f"    ✓ Router is learning meaningful routing patterns")
+
             if val_metrics['IoU'] > best_iou:
                 best_iou = val_metrics['IoU']
                 print(f"🏆 NEW BEST! IoU: {best_iou:.4f}")
@@ -548,6 +571,21 @@ def train_router(model, train_loader, val_loader, criterion, metrics, args):
         print(f"\nRouter training complete. Best IoU: {best_iou:.4f}")
 
     return best_iou
+
+
+def set_router_trainable(model, trainable):
+    """
+    Freeze or unfreeze router parameters.
+
+    Args:
+        model: The model (potentially wrapped in DDP)
+        trainable: Boolean - True to unfreeze, False to freeze
+    """
+    actual_model = get_model(model)
+
+    for name, param in actual_model.named_parameters():
+        if 'router' in name:
+            param.requires_grad = trainable
 
 
 def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, args):
@@ -576,6 +614,18 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
     # Training loop
     best_iou = 0.0
     for epoch in range(args.epochs):
+        # Router warmup: freeze router for initial epochs to stabilize expert learning
+        if args.enable_router_warmup:
+            if epoch < args.router_warmup_epochs:
+                set_router_trainable(model, trainable=False)
+                if epoch == 0 and is_main_process(args):
+                    print(f"🔒 Router FROZEN for warmup (epochs 0-{args.router_warmup_epochs-1})")
+                    print("   Experts will stabilize before routing patterns are learned\n")
+            elif epoch == args.router_warmup_epochs:
+                set_router_trainable(model, trainable=True)
+                if is_main_process(args):
+                    print(f"🔓 Router UNFROZEN (epoch {args.router_warmup_epochs}) - now learning routing patterns\n")
+
         model.train()
         total_loss = 0
         num_batches = 0
@@ -636,6 +686,23 @@ def train_full_ensemble(model, train_loader, val_loader, criterion, metrics, arg
             print(f"Epoch {epoch+1}/{args.epochs} | Loss: {avg_loss:.4f} | "
                   f"IoU: {val_metrics['IoU']:.4f} | Dice: {val_metrics['Dice_Score']:.4f} | "
                   f"LR: {current_lr:.6f}")
+
+            # Print router health diagnostics
+            if routing_stats:
+                entropy = routing_stats.get('entropy', 0)
+                avg_probs = routing_stats.get('avg_expert_probs', [])
+
+                print(f"\n  Router Health:")
+                print(f"    Entropy: {entropy:.3f} (healthy: 1.0-1.6)")
+                if avg_probs:
+                    print(f"    Expert probs: {[f'{p:.2f}' for p in avg_probs]}")
+
+                if entropy < 0.5:
+                    print(f"    ⚠️  COLLAPSE DETECTED - Router using same experts for all images!")
+                elif entropy > 1.8:
+                    print(f"    ⚠️  NO LEARNING - Router selecting randomly!")
+                else:
+                    print(f"    ✓ Router is learning meaningful routing patterns")
 
             if val_metrics['IoU'] > best_iou:
                 best_iou = val_metrics['IoU']
