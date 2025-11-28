@@ -406,9 +406,10 @@ class ProgressiveWeightingStrategy:
     """
     Progressive weighting strategy across training stages.
 
-    Early stage (0-33%): BCE + Dice
-    Mid stage (33-66%): BCE + Dice + IoU
-    Late stage (66-100%): BCE + Dice + IoU + Boundary
+    FIXED: IoU and boundary losses now active from epoch 0.
+    Early stage (0-33%): BCE + Dice + IoU + Boundary (foundation)
+    Mid stage (33-66%): BCE + Dice + IoU + Boundary (increase boundary focus)
+    Late stage (66-100%): BCE + Dice + IoU + Boundary (maximum boundary precision)
     """
     def __init__(self, total_epochs):
         self.total_epochs = total_epochs
@@ -428,6 +429,11 @@ class ProgressiveWeightingStrategy:
         """
         Get loss component weights for current epoch.
 
+        FIXED: IoU and boundary losses now active from epoch 0.
+        - Early (0-33%): Foundation with IoU + boundary enabled
+        - Mid (33-66%): Increase boundary focus
+        - Late (66-100%): Maximum boundary precision
+
         Returns:
             Dict with weights for each component
         """
@@ -436,26 +442,24 @@ class ProgressiveWeightingStrategy:
         if stage == 'early':
             return {
                 'bce_dice': 1.0,
-                'iou': 0.0,
-                'boundary': 0.0,
-                'frequency': 0.0
+                'iou': 0.5,        # IoU active from start
+                'boundary': 0.3,   # Boundary active from start
+                'frequency': 0.1
             }
         elif stage == 'mid':
-            # Gradually introduce IoU loss
             progress = (current_epoch - self.early_end) / (self.mid_end - self.early_end)
             return {
                 'bce_dice': 1.0,
-                'iou': 0.3 * progress,  # Ramp up to 0.3
-                'boundary': 0.0,
-                'frequency': 0.2 * progress  # Introduce frequency weighting
+                'iou': 0.5,
+                'boundary': 0.3 + 0.2 * progress,  # Ramp 0.3 -> 0.5
+                'frequency': 0.2
             }
         else:  # late
-            # Gradually introduce boundary loss
             progress = (current_epoch - self.mid_end) / (self.total_epochs - self.mid_end)
             return {
                 'bce_dice': 0.8,
-                'iou': 0.3,
-                'boundary': 0.5 * progress,  # Ramp up to 0.5
+                'iou': 0.5,
+                'boundary': 0.5 + 0.2 * progress,  # Ramp 0.5 -> 0.7
                 'frequency': 0.2
             }
 
