@@ -236,8 +236,9 @@ class FrequencyWeightedLoss(nn.Module):
         else:
             gray = image
 
-        # Apply Laplacian filter
-        freq_response = F.conv2d(gray, self.laplacian, padding=1)
+        # Apply Laplacian filter (convert to match input dtype for AMP compatibility)
+        laplacian = self.laplacian.to(dtype=gray.dtype, device=gray.device)
+        freq_response = F.conv2d(gray, laplacian, padding=1)
 
         # Magnitude (absolute value)
         freq_mag = torch.abs(freq_response)
