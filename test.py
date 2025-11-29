@@ -395,6 +395,89 @@ class CODMetrics:
         return {k: v / self.num_samples for k, v in self.total_metrics.items()}
 
 
+class TTAPredictor:
+    """
+    Test-Time Augmentation Predictor.
+
+    Applies multi-scale and flip augmentations during inference to improve predictions.
+    Averages predictions across all augmentations for robust results.
+    """
+
+    def __init__(self, model, scales=[0.75, 1.0, 1.25], flip=True):
+        """
+        Initialize TTA predictor.
+
+        Args:
+            model: Trained model for inference
+            scales: List of scale factors for multi-scale testing (default: [0.75, 1.0, 1.25])
+            flip: Whether to use horizontal flip augmentation (default: True)
+        """
+        self.model = model
+        self.scales = scales
+        self.flip = flip
+        self.model.eval()
+
+    @torch.no_grad()
+    def predict(self, image):
+        """
+        Perform TTA prediction on input image.
+
+        Applies multi-scale testing and optional horizontal flipping,
+        then averages all predictions for final result.
+
+        Args:
+            image: Input tensor [B, C, H, W]
+
+        Returns:
+            Averaged prediction tensor [B, 1, H, W]
+        """
+        B, C, H, W = image.shape
+        predictions = []
+
+        for scale in self.scales:
+            # Multi-scale augmentation
+            if scale != 1.0:
+                new_h, new_w = int(H * scale), int(W * scale)
+                scaled_img = F.interpolate(image, size=(new_h, new_w), mode='bilinear', align_corners=False)
+            else:
+                scaled_img = image
+
+            # Forward pass
+            pred = self.model(scaled_img)
+
+            # Resize back to original size
+            if scale != 1.0:
+                pred = F.interpolate(pred, size=(H, W), mode='bilinear', align_corners=False)
+
+            predictions.append(pred)
+
+            # Horizontal flip augmentation
+            if self.flip:
+                # Flip image horizontally
+                flipped_img = torch.flip(scaled_img, dims=[3])
+
+                # Forward pass on flipped image
+                pred_flip = self.model(flipped_img)
+
+                # Resize back if needed
+                if scale != 1.0:
+                    pred_flip = F.interpolate(pred_flip, size=(H, W), mode='bilinear', align_corners=False)
+
+                # Un-flip prediction to match original orientation
+                pred_flip = torch.flip(pred_flip, dims=[3])
+
+                predictions.append(pred_flip)
+
+        # Average all predictions
+        final_pred = torch.stack(predictions, dim=0).mean(dim=0)
+
+        return final_pred
+
+    def __call__(self, image):
+        """Allow class instance to be called like a function."""
+        return self.predict(image)
+
+
 class CODTestDataset(Dataset):
     """
     Dataset for testing on COD benchmarks.
