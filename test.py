@@ -28,6 +28,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
+import cv2
 
 from models.model_level_moe import ModelLevelMoE
 from metrics.cod_metrics import CODMetrics
@@ -112,6 +116,409 @@ class CODTestDataset(Dataset):
             'name': self.image_files[idx].stem,
             'original_size': original_size
         }
+
+
+class Visualizer:
+    """
+    Visualization utilities for COD predictions.
+
+    Creates various visualization outputs:
+    - Overlay with TP/FP/FN (Green/Red/Blue)
+    - Boundary comparison
+    - Error heatmap
+    - Segmented output (object on white background)
+    - Cutout with transparent background (RGBA)
+    - Comprehensive comparison figure
+    """
+
+    def __init__(self):
+        # Set matplotlib style
+        plt.style.use('seaborn-v0_8-darkgrid' if 'seaborn-v0_8-darkgrid' in plt.style.available else 'default')
+
+    def denormalize_image(self, img_tensor):
+        """
+        Denormalize image tensor back to [0, 255] RGB.
+
+        Args:
+            img_tensor: [C, H, W] normalized tensor
+
+        Returns:
+            numpy array [H, W, 3] in uint8 format
+        """
+        mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+
+        img = img_tensor.cpu().numpy()
+        img = img * std + mean
+        img = np.clip(img * 255, 0, 255).astype(np.uint8)
+        img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
+
+        return img
+
+    def create_overlay(self, image, pred, gt, threshold=0.5):
+        """
+        Create TP/FP/FN overlay visualization.
+
+        Green: True Positives
+        Red: False Positives
+        Blue: False Negatives
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            gt: [1, H, W] ground truth tensor (0-1)
+            threshold: Binary threshold
+
+        Returns:
+            PIL Image with overlay
+        """
+        # Denormalize image
+        img = self.denormalize_image(image)
+
+        # Binarize predictions and GT
+        pred_bin = (pred.squeeze().cpu().numpy() > threshold).astype(np.uint8)
+        gt_bin = (gt.squeeze().cpu().numpy() > threshold).astype(np.uint8)
+
+        # Compute TP, FP, FN
+        tp = (pred_bin == 1) & (gt_bin == 1)
+        fp = (pred_bin == 1) & (gt_bin == 0)
+        fn = (pred_bin == 0) & (gt_bin == 1)
+
+        # Create overlay
+        overlay = img.copy()
+
+        # Green for TP
+        overlay[tp] = (overlay[tp] * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)
+
+        # Red for FP
+        overlay[fp] = (overlay[fp] * 0.5 + np.array([255, 0, 0]) * 0.5).astype(np.uint8)
+
+        # Blue for FN
+        overlay[fn] = (overlay[fn] * 0.5 + np.array([0, 0, 255]) * 0.5).astype(np.uint8)
+
+        return Image.fromarray(overlay)
+
+    def create_boundary_overlay(self, image, pred, gt, threshold=0.5):
+        """
+        Create boundary comparison overlay.
+
+        GT boundary: Green
+        Pred boundary: Red
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            gt: [1, H, W] ground truth tensor (0-1)
+            threshold: Binary threshold
+
+        Returns:
+            PIL Image with boundary overlay
+        """
+        # Denormalize image
+        img = self.denormalize_image(image)
+
+        # Binarize
+        pred_bin = (pred.squeeze().cpu().numpy() > threshold).astype(np.uint8) * 255
+        gt_bin = (gt.squeeze().cpu().numpy() > threshold).astype(np.uint8) * 255
+
+        # Extract boundaries using Canny edge detection
+        pred_boundary = cv2.Canny(pred_bin, 50, 150)
+        gt_boundary = cv2.Canny(gt_bin, 50, 150)
+
+        # Create overlay
+        overlay = img.copy()
+
+        # Green for GT boundary
+        overlay[gt_boundary > 0] = [0, 255, 0]
+
+        # Red for Pred boundary
+        overlay[pred_boundary > 0] = [255, 0, 0]
+
+        return Image.fromarray(overlay)
+
+    def create_error_map(self, pred, gt):
+        """
+        Create error heatmap showing prediction errors.
+
+        Args:
+            pred: [1, H, W] prediction tensor (0-1)
+            gt: [1, H, W] ground truth tensor (0-1)
+
+        Returns:
+            PIL Image with error heatmap
+        """
+        # Compute absolute error
+        error = torch.abs(pred - gt).squeeze().cpu().numpy()
+
+        # Create heatmap using matplotlib colormap
+        cmap = plt.cm.jet
+        error_colored = (cmap(error)[:, :, :3] * 255).astype(np.uint8)
+
+        return Image.fromarray(error_colored)
+
+    def create_segmented_output(self, image, pred, threshold=0.5):
+        """
+        Create segmented output: predicted object on white background.
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            threshold: Binary threshold
+
+        Returns:
+            PIL Image with object on white background
+        """
+        # Denormalize image
+        img = self.denormalize_image(image)
+
+        # Binarize prediction
+        mask = (pred.squeeze().cpu().numpy() > threshold).astype(np.uint8)
+
+        # Create white background
+        output = np.ones_like(img) * 255
+
+        # Paste object
+        mask_3ch = np.stack([mask, mask, mask], axis=2)
+        output = np.where(mask_3ch, img, output).astype(np.uint8)
+
+        return Image.fromarray(output)
+
+    def create_cutout(self, image, pred, threshold=0.5):
+        """
+        Create cutout with transparent background (RGBA).
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            threshold: Binary threshold
+
+        Returns:
+            PIL Image in RGBA mode with transparent background
+        """
+        # Denormalize image
+        img = self.denormalize_image(image)
+
+        # Binarize prediction
+        mask = (pred.squeeze().cpu().numpy() > threshold).astype(np.uint8) * 255
+
+        # Create RGBA image
+        rgba = np.dstack([img, mask])
+
+        return Image.fromarray(rgba, mode='RGBA')
+
+    def create_comparison_figure(self, image, pred, gt, metrics, name, threshold=0.5):
+        """
+        Create comprehensive 12-panel comparison figure.
+
+        Layout:
+        Row 1: Original | GT | Prediction | Overlay (TP/FP/FN)
+        Row 2: Boundary Overlay | Error Map | Segmented | Cutout
+        Row 3: Pred Heatmap | GT Binary | Pred Binary | Metrics
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            gt: [1, H, W] ground truth tensor (0-1)
+            metrics: Dictionary of computed metrics
+            name: Sample name
+            threshold: Binary threshold
+
+        Returns:
+            matplotlib Figure
+        """
+        # Create figure with GridSpec for better layout
+        fig = plt.figure(figsize=(20, 15))
+        gs = GridSpec(3, 4, figure=fig, hspace=0.3, wspace=0.3)
+
+        # Denormalize image
+        img = self.denormalize_image(image)
+        pred_np = pred.squeeze().cpu().numpy()
+        gt_np = gt.squeeze().cpu().numpy()
+
+        # Row 1: Original | GT | Prediction | Overlay
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax1.imshow(img)
+        ax1.set_title('Original Image', fontsize=14, fontweight='bold')
+        ax1.axis('off')
+
+        ax2 = fig.add_subplot(gs[0, 1])
+        ax2.imshow(gt_np, cmap='gray')
+        ax2.set_title('Ground Truth', fontsize=14, fontweight='bold')
+        ax2.axis('off')
+
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.imshow(pred_np, cmap='gray')
+        ax3.set_title('Prediction', fontsize=14, fontweight='bold')
+        ax3.axis('off')
+
+        ax4 = fig.add_subplot(gs[0, 3])
+        overlay = np.array(self.create_overlay(image, pred, gt, threshold))
+        ax4.imshow(overlay)
+        ax4.set_title('TP/FP/FN Overlay', fontsize=14, fontweight='bold')
+        ax4.axis('off')
+        # Add legend
+        green_patch = mpatches.Patch(color='green', label='True Positive')
+        red_patch = mpatches.Patch(color='red', label='False Positive')
+        blue_patch = mpatches.Patch(color='blue', label='False Negative')
+        ax4.legend(handles=[green_patch, red_patch, blue_patch], loc='upper right', fontsize=10)
+
+        # Row 2: Boundary | Error Map | Segmented | Cutout
+        ax5 = fig.add_subplot(gs[1, 0])
+        boundary = np.array(self.create_boundary_overlay(image, pred, gt, threshold))
+        ax5.imshow(boundary)
+        ax5.set_title('Boundary Comparison', fontsize=14, fontweight='bold')
+        ax5.axis('off')
+        # Add legend
+        green_line = mpatches.Patch(color='green', label='GT Boundary')
+        red_line = mpatches.Patch(color='red', label='Pred Boundary')
+        ax5.legend(handles=[green_line, red_line], loc='upper right', fontsize=10)
+
+        ax6 = fig.add_subplot(gs[1, 1])
+        error_map = np.array(self.create_error_map(pred, gt))
+        im = ax6.imshow(error_map)
+        ax6.set_title('Error Heatmap', fontsize=14, fontweight='bold')
+        ax6.axis('off')
+        plt.colorbar(im, ax=ax6, fraction=0.046, pad=0.04)
+
+        ax7 = fig.add_subplot(gs[1, 2])
+        segmented = np.array(self.create_segmented_output(image, pred, threshold))
+        ax7.imshow(segmented)
+        ax7.set_title('Segmented Output', fontsize=14, fontweight='bold')
+        ax7.axis('off')
+
+        ax8 = fig.add_subplot(gs[1, 3])
+        cutout = np.array(self.create_cutout(image, pred, threshold))
+        # Create checkered background for transparency visualization
+        checker = np.indices((cutout.shape[0], cutout.shape[1])).sum(axis=0) % 20 < 10
+        checker_bg = np.ones((cutout.shape[0], cutout.shape[1], 3)) * 200
+        checker_bg[checker] = 150
+        # Blend with alpha
+        alpha = cutout[:, :, 3:4] / 255.0
+        blended = cutout[:, :, :3] * alpha + checker_bg * (1 - alpha)
+        ax8.imshow(blended.astype(np.uint8))
+        ax8.set_title('Cutout (RGBA)', fontsize=14, fontweight='bold')
+        ax8.axis('off')
+
+        # Row 3: Heatmaps and Metrics
+        ax9 = fig.add_subplot(gs[2, 0])
+        im = ax9.imshow(pred_np, cmap='hot')
+        ax9.set_title('Prediction Heatmap', fontsize=14, fontweight='bold')
+        ax9.axis('off')
+        plt.colorbar(im, ax=ax9, fraction=0.046, pad=0.04)
+
+        ax10 = fig.add_subplot(gs[2, 1])
+        pred_bin = (pred_np > threshold).astype(float)
+        ax10.imshow(pred_bin, cmap='gray')
+        ax10.set_title('Prediction Binary', fontsize=14, fontweight='bold')
+        ax10.axis('off')
+
+        ax11 = fig.add_subplot(gs[2, 2])
+        gt_bin = (gt_np > threshold).astype(float)
+        ax11.imshow(gt_bin, cmap='gray')
+        ax11.set_title('GT Binary', fontsize=14, fontweight='bold')
+        ax11.axis('off')
+
+        # Metrics panel
+        ax12 = fig.add_subplot(gs[2, 3])
+        ax12.axis('off')
+
+        metrics_text = f"""
+        Sample: {name}
+
+        Primary Metrics:
+        ━━━━━━━━━━━━━━━━━━━━
+        S-measure: {metrics['S-measure']:.4f} ⭐
+        F-measure: {metrics['F-measure']:.4f}
+        E-measure: {metrics['E-measure']:.4f}
+        MAE:       {metrics['MAE']:.4f}
+        IoU:       {metrics['IoU']:.4f}
+
+        Accuracy Metrics:
+        ━━━━━━━━━━━━━━━━━━━━
+        Precision: {metrics['Precision']:.4f}
+        Recall:    {metrics['Recall']:.4f}
+        Dice:      {metrics['Dice_Score']:.4f}
+        Pixel Acc: {metrics['Pixel_Accuracy']:.4f}
+        Specific:  {metrics['Specificity']:.4f}
+        """
+
+        ax12.text(0.1, 0.5, metrics_text, fontsize=12, family='monospace',
+                 verticalalignment='center', transform=ax12.transAxes)
+
+        # Overall title
+        fig.suptitle(f'CamoXpert Evaluation: {name}', fontsize=18, fontweight='bold', y=0.98)
+
+        plt.tight_layout()
+
+        return fig
+
+    def save_individual_outputs(self, image, pred, gt, name, save_dir, threshold=0.5):
+        """
+        Save all individual visualizations to files.
+
+        Args:
+            image: [C, H, W] normalized image tensor
+            pred: [1, H, W] prediction tensor (0-1)
+            gt: [1, H, W] ground truth tensor (0-1)
+            name: Sample name
+            save_dir: Directory to save outputs
+            threshold: Binary threshold
+
+        Returns:
+            Dictionary mapping output type to file path
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        outputs = {}
+
+        # Original image
+        img = self.denormalize_image(image)
+        img_pil = Image.fromarray(img)
+        img_path = save_dir / f"{name}_original.png"
+        img_pil.save(img_path)
+        outputs['original'] = img_path
+
+        # Ground truth
+        gt_np = (gt.squeeze().cpu().numpy() * 255).astype(np.uint8)
+        gt_pil = Image.fromarray(gt_np, mode='L')
+        gt_path = save_dir / f"{name}_gt.png"
+        gt_pil.save(gt_path)
+        outputs['gt'] = gt_path
+
+        # Prediction
+        pred_np = (pred.squeeze().cpu().numpy() * 255).astype(np.uint8)
+        pred_pil = Image.fromarray(pred_np, mode='L')
+        pred_path = save_dir / f"{name}_pred.png"
+        pred_pil.save(pred_path)
+        outputs['pred'] = pred_path
+
+        # Overlay
+        overlay_path = save_dir / f"{name}_overlay.png"
+        self.create_overlay(image, pred, gt, threshold).save(overlay_path)
+        outputs['overlay'] = overlay_path
+
+        # Boundary overlay
+        boundary_path = save_dir / f"{name}_boundary.png"
+        self.create_boundary_overlay(image, pred, gt, threshold).save(boundary_path)
+        outputs['boundary'] = boundary_path
+
+        # Error map
+        error_path = save_dir / f"{name}_error.png"
+        self.create_error_map(pred, gt).save(error_path)
+        outputs['error'] = error_path
+
+        # Segmented output
+        segmented_path = save_dir / f"{name}_segmented.png"
+        self.create_segmented_output(image, pred, threshold).save(segmented_path)
+        outputs['segmented'] = segmented_path
+
+        # Cutout (RGBA)
+        cutout_path = save_dir / f"{name}_cutout.png"
+        self.create_cutout(image, pred, threshold).save(cutout_path)
+        outputs['cutout'] = cutout_path
+
+        return outputs
 
 
 def load_checkpoint(checkpoint_path, num_experts=4, device='cuda'):
@@ -226,7 +633,8 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
     return final_pred
 
 
-def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, output_dir=None):
+def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, output_dir=None,
+                     save_visualizations=False, num_vis_samples=None):
     """
     Evaluate model on a dataset.
 
@@ -237,6 +645,8 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
         use_tta: Whether to use Test-Time Augmentation
         threshold: Threshold for binary prediction
         output_dir: Optional directory to save prediction masks
+        save_visualizations: Whether to save visualizations
+        num_vis_samples: Number of samples to visualize (None = all)
 
     Returns:
         Dictionary of computed metrics
@@ -248,6 +658,10 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create visualizer if needed
+    visualizer = Visualizer() if save_visualizations else None
+    vis_count = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"  Evaluating {dataset.root.name}"):
@@ -264,7 +678,12 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
             # Apply sigmoid
             pred = torch.sigmoid(pred)
 
-            # Update metrics
+            # Compute metrics for this sample
+            sample_metrics = CODMetrics()
+            sample_metrics.update(pred, gt, threshold=threshold)
+            sample_metrics_dict = sample_metrics.compute()
+
+            # Update overall metrics
             metrics.update(pred, gt, threshold=threshold)
 
             # Save prediction if requested
@@ -272,6 +691,27 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
                 pred_np = (pred.squeeze().cpu().numpy() * 255).astype(np.uint8)
                 pred_img = Image.fromarray(pred_np)
                 pred_img.save(output_dir / f"{name}.png")
+
+            # Save visualizations if requested
+            if save_visualizations and (num_vis_samples is None or vis_count < num_vis_samples):
+                vis_dir = output_dir.parent / 'visualizations' / dataset.root.name if output_dir else Path('visualizations') / dataset.root.name
+
+                # Save comparison figure
+                fig = visualizer.create_comparison_figure(
+                    image.squeeze(0), pred, gt, sample_metrics_dict, name, threshold
+                )
+                fig_path = vis_dir / 'figures'
+                fig_path.mkdir(parents=True, exist_ok=True)
+                fig.savefig(fig_path / f"{name}_comparison.png", dpi=150, bbox_inches='tight')
+                plt.close(fig)
+
+                # Save individual outputs
+                individual_dir = vis_dir / 'individual' / name
+                visualizer.save_individual_outputs(
+                    image.squeeze(0), pred, gt, name, individual_dir, threshold
+                )
+
+                vis_count += 1
 
     # Compute final metrics
     final_metrics = metrics.compute()
@@ -363,6 +803,10 @@ def main():
                        help='Threshold for binary prediction (default: 0.5)')
     parser.add_argument('--save-predictions', action='store_true',
                        help='Save prediction masks to output directory')
+    parser.add_argument('--save-visualizations', action='store_true',
+                       help='Save comprehensive visualizations (overlays, boundaries, error maps, etc.)')
+    parser.add_argument('--num-vis-samples', type=int, default=None,
+                       help='Number of samples to visualize per dataset (default: all)')
 
     # Output arguments
     parser.add_argument('--output-dir', type=str, default='./test_results',
@@ -385,6 +829,9 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Datasets: {', '.join(args.datasets)}")
     print(f"TTA: {'Enabled' if args.tta else 'Disabled'}")
+    print(f"Visualizations: {'Enabled' if args.save_visualizations else 'Disabled'}")
+    if args.save_visualizations:
+        print(f"  Vis samples per dataset: {args.num_vis_samples if args.num_vis_samples else 'All'}")
     print(f"Device: {device}")
     print("="*70 + "\n")
 
@@ -428,7 +875,9 @@ def main():
                 model, dataset, device,
                 use_tta=args.tta,
                 threshold=args.threshold,
-                output_dir=pred_dir
+                output_dir=pred_dir,
+                save_visualizations=args.save_visualizations,
+                num_vis_samples=args.num_vis_samples
             )
 
             # Store results
