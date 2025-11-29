@@ -1076,7 +1076,8 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
     return final_pred
 
 
-def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, threshold=0.5, output_dir=None,
+def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, threshold=0.5,
+                     threshold_method='fixed', output_dir=None,
                      save_visualizations=False, num_vis_samples=None, collect_for_optimization=False):
     """
     Evaluate model on a dataset.
@@ -1087,7 +1088,8 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
         device: Device to run evaluation on
         use_tta: Whether to use Test-Time Augmentation
         use_crf: Whether to use CRF post-processing
-        threshold: Threshold for binary prediction
+        threshold: Threshold for binary prediction (used if threshold_method='fixed')
+        threshold_method: Method for threshold selection ('fixed', 'otsu', 'adaptive-mean', 'adaptive-median')
         output_dir: Optional directory to save prediction masks
         save_visualizations: Whether to save visualizations
         num_vis_samples: Number of samples to visualize (None = all)
@@ -1139,6 +1141,17 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 # Convert back to tensor
                 pred = torch.from_numpy(pred_refined).unsqueeze(0).unsqueeze(0).to(device)
 
+            # Compute adaptive threshold per image if requested
+            sample_threshold = threshold  # Default
+            if threshold_method != 'fixed':
+                pred_np_for_thresh = pred.squeeze().cpu().numpy()
+                if threshold_method == 'otsu':
+                    sample_threshold = ThresholdOptimizer.otsu(pred_np_for_thresh)
+                elif threshold_method == 'adaptive-mean':
+                    sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='mean')
+                elif threshold_method == 'adaptive-median':
+                    sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='median')
+
             # Collect for threshold optimization if requested
             if collect_for_optimization:
                 pred_np = pred.squeeze().cpu().numpy()
@@ -1148,11 +1161,11 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
 
             # Compute metrics for this sample
             sample_metrics = CODMetrics()
-            sample_metrics.update(pred, gt, threshold=threshold)
+            sample_metrics.update(pred, gt, threshold=sample_threshold)
             sample_metrics_dict = sample_metrics.compute()
 
             # Update overall metrics
-            metrics.update(pred, gt, threshold=threshold)
+            metrics.update(pred, gt, threshold=sample_threshold)
 
             # Save prediction if requested
             if output_dir is not None:
@@ -1166,7 +1179,7 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
 
                 # Save comparison figure
                 fig = visualizer.create_comparison_figure(
-                    image.squeeze(0), pred, gt, sample_metrics_dict, name, threshold
+                    image.squeeze(0), pred, gt, sample_metrics_dict, name, sample_threshold
                 )
                 fig_path = vis_dir / 'figures'
                 fig_path.mkdir(parents=True, exist_ok=True)
@@ -1176,7 +1189,7 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 # Save individual outputs
                 individual_dir = vis_dir / 'individual' / name
                 visualizer.save_individual_outputs(
-                    image.squeeze(0), pred, gt, name, individual_dir, threshold
+                    image.squeeze(0), pred, gt, name, individual_dir, sample_threshold
                 )
 
                 vis_count += 1
@@ -1329,8 +1342,11 @@ def main():
                        help='Enable CRF post-processing for boundary refinement')
     parser.add_argument('--threshold', type=float, default=0.5,
                        help='Threshold for binary prediction (default: 0.5)')
+    parser.add_argument('--threshold-method', type=str, default='fixed',
+                       choices=['fixed', 'otsu', 'adaptive-mean', 'adaptive-median'],
+                       help='Threshold selection method: fixed (default), otsu (per-image), adaptive-mean, adaptive-median')
     parser.add_argument('--optimize-threshold', action='store_true',
-                       help='Find optimal threshold per dataset using grid search')
+                       help='Find optimal threshold per dataset using grid search (overrides threshold-method)')
     parser.add_argument('--save-predictions', action='store_true',
                        help='Save prediction masks to output directory')
     parser.add_argument('--save-visualizations', action='store_true',
@@ -1370,8 +1386,14 @@ def main():
         except:
             print("  Using morphological refinement")
     print(f"Threshold Optimization: {'Enabled' if args.optimize_threshold else 'Disabled'}")
-    if not args.optimize_threshold:
-        print(f"  Binary threshold: {args.threshold}")
+    if args.optimize_threshold:
+        print(f"  Will find optimal threshold via grid search")
+    else:
+        print(f"  Threshold method: {args.threshold_method}")
+        if args.threshold_method == 'fixed':
+            print(f"  Binary threshold: {args.threshold}")
+        else:
+            print(f"  Per-image adaptive thresholding")
     print(f"Visualizations: {'Enabled' if args.save_visualizations else 'Disabled'}")
     if args.save_visualizations:
         print(f"  Vis samples per dataset: {args.num_vis_samples if args.num_vis_samples else 'All'}")
@@ -1417,11 +1439,13 @@ def main():
 
             if args.optimize_threshold:
                 # Collect predictions for threshold optimization
+                # Note: When optimizing threshold globally, we use fixed threshold for initial evaluation
                 metrics, all_preds, all_gts = evaluate_dataset(
                     model, dataset, device,
                     use_tta=args.tta,
                     use_crf=args.use_crf,
                     threshold=args.threshold,
+                    threshold_method='fixed',  # Use fixed for initial pass
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
                     num_vis_samples=args.num_vis_samples,
@@ -1455,6 +1479,7 @@ def main():
                     use_tta=args.tta,
                     use_crf=args.use_crf,
                     threshold=best_thr_iou,
+                    threshold_method='fixed',  # Use optimized fixed threshold
                     output_dir=None,  # Don't save predictions again
                     save_visualizations=False,  # Don't save visualizations again
                     collect_for_optimization=False
@@ -1489,6 +1514,7 @@ def main():
                     use_tta=args.tta,
                     use_crf=args.use_crf,
                     threshold=args.threshold,
+                    threshold_method=args.threshold_method,
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
                     num_vis_samples=args.num_vis_samples
