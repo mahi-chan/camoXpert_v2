@@ -32,9 +32,367 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 import cv2
+from scipy.ndimage import distance_transform_edt
 
 from models.model_level_moe import ModelLevelMoE
-from metrics.cod_metrics import CODMetrics
+
+
+class CODMetrics:
+    """
+    Camouflaged Object Detection Metrics.
+
+    All methods accept numpy arrays [H, W] with values in [0, 1].
+    Implements standard COD evaluation metrics from literature.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset accumulated metrics."""
+        self.total_metrics = {}
+        self.num_samples = 0
+
+    def s_measure(self, pred, gt, alpha=0.5):
+        """
+        Structure Measure (S-measure).
+
+        Evaluates structural similarity between prediction and ground truth.
+        Combines object-level and region-level assessments.
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+            alpha: Balance between object and region scores (default: 0.5)
+
+        Returns:
+            S-measure score (higher is better, range [0, 1])
+        """
+        y = np.mean(gt)
+
+        if y == 0:  # No object in GT
+            return 1.0 - np.mean(pred)
+        elif y == 1:  # Entire image is object
+            return np.mean(pred)
+        else:
+            # Object-level score
+            So = self._s_object(pred, gt)
+            # Region-level score
+            Sr = self._s_region(pred, gt)
+            # Combined score
+            return alpha * So + (1 - alpha) * Sr
+
+    def _s_object(self, pred, gt):
+        """Compute object-level structure similarity."""
+        # Foreground
+        pred_fg = pred * gt
+        O_fg = self._object_score(pred_fg, gt)
+
+        # Background
+        pred_bg = (1 - pred) * (1 - gt)
+        O_bg = self._object_score(pred_bg, 1 - gt)
+
+        # Weighted combination
+        u = np.mean(gt)
+        return u * O_fg + (1 - u) * O_bg
+
+    def _object_score(self, pred, gt):
+        """Compute object score."""
+        gt_sum = np.sum(gt)
+        if gt_sum == 0:
+            return 0.0
+
+        pred_mean = np.sum(pred) / (gt_sum + 1e-8)
+        sigma = np.sum((pred - pred_mean) ** 2) / (gt_sum + 1e-8)
+
+        return 2.0 * pred_mean / (pred_mean ** 2 + 1.0 + sigma + 1e-8)
+
+    def _s_region(self, pred, gt):
+        """Compute region-level structure similarity."""
+        # Find centroid
+        X, Y = self._centroid(gt)
+
+        # Divide into 4 regions
+        pred1 = pred[:Y, :X]
+        pred2 = pred[:Y, X:]
+        pred3 = pred[Y:, :X]
+        pred4 = pred[Y:, X:]
+
+        gt1 = gt[:Y, :X]
+        gt2 = gt[:Y, X:]
+        gt3 = gt[Y:, :X]
+        gt4 = gt[Y:, X:]
+
+        # Compute SSIM for each region
+        Q1 = self._ssim(pred1, gt1)
+        Q2 = self._ssim(pred2, gt2)
+        Q3 = self._ssim(pred3, gt3)
+        Q4 = self._ssim(pred4, gt4)
+
+        # Compute weights
+        H, W = gt.shape
+        w1 = X * Y / (H * W + 1e-8)
+        w2 = (W - X) * Y / (H * W + 1e-8)
+        w3 = X * (H - Y) / (H * W + 1e-8)
+        w4 = (W - X) * (H - Y) / (H * W + 1e-8)
+
+        # Weighted combination
+        return w1 * Q1 + w2 * Q2 + w3 * Q3 + w4 * Q4
+
+    def _centroid(self, gt):
+        """Compute centroid of ground truth mask."""
+        H, W = gt.shape
+        rows = np.arange(H)
+        cols = np.arange(W)
+
+        total = np.sum(gt) + 1e-8
+
+        # Column centroid
+        X = int(np.sum(np.sum(gt, axis=0) * cols) / total)
+        # Row centroid
+        Y = int(np.sum(np.sum(gt, axis=1) * rows) / total)
+
+        # Clamp to valid range
+        X = max(1, min(X, W - 1))
+        Y = max(1, min(Y, H - 1))
+
+        return X, Y
+
+    def _ssim(self, pred, gt):
+        """Compute structural similarity (SSIM)."""
+        H, W = pred.shape
+
+        if H < 2 or W < 2:
+            return 0.0
+
+        N = H * W
+
+        # Means
+        x = np.mean(pred)
+        y = np.mean(gt)
+
+        # Variances and covariance
+        sigma_x2 = np.sum((pred - x) ** 2) / (N - 1 + 1e-8)
+        sigma_y2 = np.sum((gt - y) ** 2) / (N - 1 + 1e-8)
+        sigma_xy = np.sum((pred - x) * (gt - y)) / (N - 1 + 1e-8)
+
+        # SSIM formula
+        alpha = 4 * x * y * sigma_xy
+        beta = (x ** 2 + y ** 2) * (sigma_x2 + sigma_y2)
+
+        if alpha != 0:
+            return alpha / (beta + 1e-8)
+        elif beta == 0:
+            return 1.0
+        else:
+            return 0.0
+
+    def f_measure(self, pred, gt, threshold=0.5, beta2=0.3):
+        """
+        F-measure (weighted F-score).
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+            threshold: Binary threshold (default: 0.5)
+            beta2: Beta squared for F-beta score (default: 0.3)
+
+        Returns:
+            F-measure score (higher is better, range [0, 1])
+        """
+        # Binarize
+        pred_bin = (pred > threshold).astype(np.float32)
+        gt_bin = (gt > threshold).astype(np.float32)
+
+        # True positives, false positives, false negatives
+        tp = np.sum(pred_bin * gt_bin)
+        fp = np.sum(pred_bin * (1 - gt_bin))
+        fn = np.sum((1 - pred_bin) * gt_bin)
+
+        # Precision and recall
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+
+        # F-measure
+        f_score = (1 + beta2) * precision * recall / (beta2 * precision + recall + 1e-8)
+
+        return f_score
+
+    def e_measure(self, pred, gt):
+        """
+        Enhanced-alignment Measure (E-measure).
+
+        Evaluates pixel-level and image-level alignment.
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+
+        Returns:
+            E-measure score (higher is better, range [0, 1])
+        """
+        if np.sum(gt) == 0:  # No object
+            return 1.0 - np.mean(pred)
+
+        # Enhanced alignment matrix
+        enhanced = self._enhanced_alignment_matrix(pred, gt)
+
+        return np.mean(enhanced)
+
+    def _enhanced_alignment_matrix(self, pred, gt):
+        """Compute enhanced alignment matrix."""
+        # Binarize GT for foreground/background
+        gt_fg = (gt > 0.5).astype(np.float32)
+        gt_bg = 1 - gt_fg
+
+        # Compute alignment
+        pred_mean = np.mean(pred)
+
+        alignment = np.zeros_like(pred)
+
+        # Foreground alignment
+        if np.sum(gt_fg) > 0:
+            alignment += ((pred - pred_mean) ** 2) * gt_fg / (np.sum(gt_fg) + 1e-8)
+
+        # Background alignment
+        if np.sum(gt_bg) > 0:
+            alignment += ((pred - pred_mean) ** 2) * gt_bg / (np.sum(gt_bg) + 1e-8)
+
+        # Enhanced matrix
+        enhanced = 2 * alignment
+
+        # Normalize to [0, 1]
+        enhanced = 1.0 / (1.0 + enhanced)
+
+        return enhanced
+
+    def mae(self, pred, gt):
+        """
+        Mean Absolute Error.
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+
+        Returns:
+            MAE score (lower is better, range [0, 1])
+        """
+        return np.mean(np.abs(pred - gt))
+
+    def iou(self, pred, gt, threshold=0.5):
+        """
+        Intersection over Union (IoU).
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+            threshold: Binary threshold (default: 0.5)
+
+        Returns:
+            IoU score (higher is better, range [0, 1])
+        """
+        # Binarize
+        pred_bin = (pred > threshold).astype(np.float32)
+        gt_bin = (gt > threshold).astype(np.float32)
+
+        # Intersection and union
+        intersection = np.sum(pred_bin * gt_bin)
+        union = np.sum(pred_bin) + np.sum(gt_bin) - intersection
+
+        return intersection / (union + 1e-8)
+
+    def weighted_f_measure(self, pred, gt, threshold=0.5):
+        """
+        Distance-weighted F-measure.
+
+        Weights errors based on distance to object boundary.
+        Errors near boundaries are penalized more heavily.
+
+        Args:
+            pred: Prediction array [H, W] with values in [0, 1]
+            gt: Ground truth array [H, W] with values in [0, 1]
+            threshold: Binary threshold (default: 0.5)
+
+        Returns:
+            Weighted F-measure score (higher is better, range [0, 1])
+        """
+        from scipy.ndimage import distance_transform_edt
+
+        # Binarize
+        pred_bin = (pred > threshold).astype(np.uint8)
+        gt_bin = (gt > threshold).astype(np.uint8)
+
+        # Compute distance transforms
+        # Distance to nearest boundary
+        dt_gt = distance_transform_edt(gt_bin) + distance_transform_edt(1 - gt_bin)
+
+        # Inverse distance weighting (closer to boundary = higher weight)
+        weights = 1.0 / (dt_gt + 1.0)
+        weights = weights / np.max(weights)  # Normalize
+
+        # Weighted true positives, false positives, false negatives
+        tp = np.sum(weights * pred_bin * gt_bin)
+        fp = np.sum(weights * pred_bin * (1 - gt_bin))
+        fn = np.sum(weights * (1 - pred_bin) * gt_bin)
+
+        # Weighted precision and recall
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+
+        # Weighted F-measure
+        f_score = 2 * precision * recall / (precision + recall + 1e-8)
+
+        return f_score
+
+    def update(self, pred, gt, threshold=0.5):
+        """
+        Update metrics with a new sample.
+
+        Args:
+            pred: Prediction tensor or array [B, 1, H, W] or [H, W]
+            gt: Ground truth tensor or array [B, 1, H, W] or [H, W]
+            threshold: Binary threshold
+        """
+        # Convert to numpy if tensor
+        if torch.is_tensor(pred):
+            pred = pred.detach().cpu().numpy()
+        if torch.is_tensor(gt):
+            gt = gt.detach().cpu().numpy()
+
+        # Squeeze to [H, W]
+        pred = np.squeeze(pred)
+        gt = np.squeeze(gt)
+
+        # Compute all metrics
+        metrics = {
+            'S-measure': self.s_measure(pred, gt),
+            'F-measure': self.f_measure(pred, gt, threshold),
+            'E-measure': self.e_measure(pred, gt),
+            'MAE': self.mae(pred, gt),
+            'IoU': self.iou(pred, gt, threshold),
+            'Weighted-F': self.weighted_f_measure(pred, gt, threshold)
+        }
+
+        # Accumulate
+        if self.num_samples == 0:
+            self.total_metrics = metrics
+        else:
+            for k, v in metrics.items():
+                self.total_metrics[k] += v
+
+        self.num_samples += 1
+
+    def compute(self):
+        """
+        Compute average metrics.
+
+        Returns:
+            Dictionary of averaged metrics
+        """
+        if self.num_samples == 0:
+            return {}
+
+        return {k: v / self.num_samples for k, v in self.total_metrics.items()}
 
 
 class CODTestDataset(Dataset):
