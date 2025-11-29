@@ -36,6 +36,7 @@ from scipy.ndimage import distance_transform_edt
 
 from models.model_level_moe import ModelLevelMoE
 from utils.threshold_optimizer import ThresholdOptimizer
+from utils.crf_refiner import CRFRefiner
 
 
 class CODMetrics:
@@ -1075,7 +1076,7 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
     return final_pred
 
 
-def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, output_dir=None,
+def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, threshold=0.5, output_dir=None,
                      save_visualizations=False, num_vis_samples=None, collect_for_optimization=False):
     """
     Evaluate model on a dataset.
@@ -1085,6 +1086,7 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
         dataset: Test dataset
         device: Device to run evaluation on
         use_tta: Whether to use Test-Time Augmentation
+        use_crf: Whether to use CRF post-processing
         threshold: Threshold for binary prediction
         output_dir: Optional directory to save prediction masks
         save_visualizations: Whether to save visualizations
@@ -1106,6 +1108,9 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
     visualizer = Visualizer() if save_visualizations else None
     vis_count = 0
 
+    # Create CRF refiner if needed
+    crf_refiner = CRFRefiner() if use_crf else None
+
     # Collect predictions and GTs for threshold optimization
     all_preds = [] if collect_for_optimization else None
     all_gts = [] if collect_for_optimization else None
@@ -1124,6 +1129,15 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
 
             # Apply sigmoid
             pred = torch.sigmoid(pred)
+
+            # Apply CRF refinement if requested
+            if use_crf:
+                # CRF refiner expects image and probability map
+                # Denormalize image for CRF
+                img_for_crf = image.squeeze(0)  # [C, H, W]
+                pred_refined = crf_refiner.refine(img_for_crf, pred)
+                # Convert back to tensor
+                pred = torch.from_numpy(pred_refined).unsqueeze(0).unsqueeze(0).to(device)
 
             # Collect for threshold optimization if requested
             if collect_for_optimization:
@@ -1311,6 +1325,8 @@ def main():
     # Evaluation arguments
     parser.add_argument('--tta', action='store_true',
                        help='Enable Test-Time Augmentation (multi-scale + flip)')
+    parser.add_argument('--use-crf', action='store_true',
+                       help='Enable CRF post-processing for boundary refinement')
     parser.add_argument('--threshold', type=float, default=0.5,
                        help='Threshold for binary prediction (default: 0.5)')
     parser.add_argument('--optimize-threshold', action='store_true',
@@ -1343,6 +1359,16 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Datasets: {', '.join(args.datasets)}")
     print(f"TTA: {'Enabled' if args.tta else 'Disabled'}")
+    print(f"CRF Refinement: {'Enabled' if args.use_crf else 'Disabled'}")
+    if args.use_crf:
+        try:
+            from utils.crf_refiner import HAS_CRF
+            if HAS_CRF:
+                print("  Using Dense CRF (pydensecrf)")
+            else:
+                print("  Using morphological refinement (pydensecrf not available)")
+        except:
+            print("  Using morphological refinement")
     print(f"Threshold Optimization: {'Enabled' if args.optimize_threshold else 'Disabled'}")
     if not args.optimize_threshold:
         print(f"  Binary threshold: {args.threshold}")
@@ -1394,6 +1420,7 @@ def main():
                 metrics, all_preds, all_gts = evaluate_dataset(
                     model, dataset, device,
                     use_tta=args.tta,
+                    use_crf=args.use_crf,
                     threshold=args.threshold,
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
@@ -1426,6 +1453,7 @@ def main():
                 metrics_optimal = evaluate_dataset(
                     model, dataset, device,
                     use_tta=args.tta,
+                    use_crf=args.use_crf,
                     threshold=best_thr_iou,
                     output_dir=None,  # Don't save predictions again
                     save_visualizations=False,  # Don't save visualizations again
@@ -1459,6 +1487,7 @@ def main():
                 metrics = evaluate_dataset(
                     model, dataset, device,
                     use_tta=args.tta,
+                    use_crf=args.use_crf,
                     threshold=args.threshold,
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
