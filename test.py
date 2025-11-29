@@ -35,6 +35,7 @@ import cv2
 from scipy.ndimage import distance_transform_edt
 
 from models.model_level_moe import ModelLevelMoE
+from utils.threshold_optimizer import ThresholdOptimizer
 
 
 class CODMetrics:
@@ -1075,7 +1076,7 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
 
 
 def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, output_dir=None,
-                     save_visualizations=False, num_vis_samples=None):
+                     save_visualizations=False, num_vis_samples=None, collect_for_optimization=False):
     """
     Evaluate model on a dataset.
 
@@ -1088,9 +1089,10 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
         output_dir: Optional directory to save prediction masks
         save_visualizations: Whether to save visualizations
         num_vis_samples: Number of samples to visualize (None = all)
+        collect_for_optimization: If True, collect all predictions and GTs for threshold optimization
 
     Returns:
-        Dictionary of computed metrics
+        Dictionary of computed metrics (and optionally lists of predictions and GTs)
     """
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
     metrics = CODMetrics()
@@ -1103,6 +1105,10 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
     # Create visualizer if needed
     visualizer = Visualizer() if save_visualizations else None
     vis_count = 0
+
+    # Collect predictions and GTs for threshold optimization
+    all_preds = [] if collect_for_optimization else None
+    all_gts = [] if collect_for_optimization else None
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"  Evaluating {dataset.root.name}"):
@@ -1118,6 +1124,13 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
 
             # Apply sigmoid
             pred = torch.sigmoid(pred)
+
+            # Collect for threshold optimization if requested
+            if collect_for_optimization:
+                pred_np = pred.squeeze().cpu().numpy()
+                gt_np = gt.squeeze().cpu().numpy()
+                all_preds.append(pred_np)
+                all_gts.append(gt_np)
 
             # Compute metrics for this sample
             sample_metrics = CODMetrics()
@@ -1157,7 +1170,10 @@ def evaluate_dataset(model, dataset, device, use_tta=False, threshold=0.5, outpu
     # Compute final metrics
     final_metrics = metrics.compute()
 
-    return final_metrics
+    if collect_for_optimization:
+        return final_metrics, all_preds, all_gts
+    else:
+        return final_metrics
 
 
 def save_results_json(results, output_path):
@@ -1167,47 +1183,102 @@ def save_results_json(results, output_path):
     print(f"✓ Results saved to: {output_path}")
 
 
-def save_results_markdown(results, output_path, checkpoint_path, use_tta):
+def save_results_markdown(results, output_path, checkpoint_path, use_tta, optimize_threshold=False):
     """Save results to Markdown file with formatted tables."""
     with open(output_path, 'w') as f:
         f.write("# CamoXpert Evaluation Results\n\n")
         f.write(f"**Checkpoint**: `{checkpoint_path}`\n\n")
         f.write(f"**Test-Time Augmentation**: {'Enabled' if use_tta else 'Disabled'}\n\n")
 
-        # Main metrics table
-        f.write("## Primary Metrics\n\n")
-        f.write("| Dataset | S-measure ⭐ | F-measure | E-measure | MAE ↓ | IoU |\n")
-        f.write("|---------|-------------|-----------|-----------|-------|-----|\n")
+        # Check if threshold optimization was used
+        if optimize_threshold and 'average' in results and 'optimal_metrics' in results['average']:
+            # Threshold optimization results
+            f.write("## Threshold Optimization Results\n\n")
 
-        for dataset_name, metrics in results.items():
-            if dataset_name != 'average':
-                f.write(f"| {dataset_name:11} | {metrics['S-measure']:.4f} | "
-                       f"{metrics['F-measure']:.4f} | {metrics['E-measure']:.4f} | "
-                       f"{metrics['MAE']:.4f} | {metrics['IoU']:.4f} |\n")
+            # Default threshold results
+            f.write(f"### Default Threshold Results\n\n")
+            f.write("| Dataset | Threshold | S-measure | F-measure | E-measure | MAE ↓ | IoU |\n")
+            f.write("|---------|-----------|-----------|-----------|-----------|-------|-----|\n")
 
-        # Average row
-        if 'average' in results:
-            avg = results['average']
-            f.write(f"| **Average** | **{avg['S-measure']:.4f}** | "
-                   f"**{avg['F-measure']:.4f}** | **{avg['E-measure']:.4f}** | "
-                   f"**{avg['MAE']:.4f}** | **{avg['IoU']:.4f}** |\n")
+            for dataset_name, data in results.items():
+                if dataset_name != 'average':
+                    metrics = data['default_metrics']
+                    thr = data['default_threshold']
+                    f.write(f"| {dataset_name:11} | {thr:.2f} | {metrics['S-measure']:.4f} | "
+                           f"{metrics['F-measure']:.4f} | {metrics['E-measure']:.4f} | "
+                           f"{metrics['MAE']:.4f} | {metrics['IoU']:.4f} |\n")
 
-        # Additional metrics table
-        f.write("\n## Additional Metrics\n\n")
-        f.write("| Dataset | Precision | Recall | Dice Score | Pixel Acc | Specificity |\n")
-        f.write("|---------|-----------|--------|------------|-----------|-------------|\n")
+            if 'average' in results:
+                avg = results['average']['default_metrics']
+                thr = results['average']['default_threshold']
+                f.write(f"| **Average** | {thr:.2f} | **{avg['S-measure']:.4f}** | "
+                       f"**{avg['F-measure']:.4f}** | **{avg['E-measure']:.4f}** | "
+                       f"**{avg['MAE']:.4f}** | **{avg['IoU']:.4f}** |\n")
 
-        for dataset_name, metrics in results.items():
-            if dataset_name != 'average':
-                f.write(f"| {dataset_name:11} | {metrics['Precision']:.4f} | "
-                       f"{metrics['Recall']:.4f} | {metrics['Dice_Score']:.4f} | "
-                       f"{metrics['Pixel_Accuracy']:.4f} | {metrics['Specificity']:.4f} |\n")
+            # Optimal threshold results
+            f.write(f"\n### Optimal Threshold Results\n\n")
+            f.write("| Dataset | Threshold (IoU) | Threshold (F1) | S-measure ⭐ | F-measure | E-measure | MAE ↓ | IoU | Improvement |\n")
+            f.write("|---------|-----------------|----------------|-------------|-----------|-----------|-------|-----|-------------|\n")
 
-        # Average row
-        if 'average' in results:
-            avg = results['average']
-            f.write(f"| **Average** | **{avg['Precision']:.4f}** | "
-                   f"**{avg['Recall']:.4f}** | **{avg['Dice_Score']:.4f}** | "
+            for dataset_name, data in results.items():
+                if dataset_name != 'average':
+                    metrics = data['optimal_metrics']
+                    thr_iou = data['optimal_threshold_iou']
+                    thr_f1 = data['optimal_threshold_f1']
+                    imp_iou = data['improvement_iou']
+                    imp_f1 = data['improvement_f1']
+                    f.write(f"| {dataset_name:11} | {thr_iou:.2f} | {thr_f1:.2f} | "
+                           f"{metrics['S-measure']:.4f} | {metrics['F-measure']:.4f} | "
+                           f"{metrics['E-measure']:.4f} | {metrics['MAE']:.4f} | "
+                           f"{metrics['IoU']:.4f} | IoU: +{imp_iou:.2f}%, F1: +{imp_f1:.2f}% |\n")
+
+            if 'average' in results:
+                avg = results['average']['optimal_metrics']
+                thr_iou = results['average']['optimal_threshold_iou']
+                thr_f1 = results['average']['optimal_threshold_f1']
+                imp_iou = results['average']['improvement_iou']
+                imp_f1 = results['average']['improvement_f1']
+                f.write(f"| **Average** | {thr_iou:.2f} | {thr_f1:.2f} | "
+                       f"**{avg['S-measure']:.4f}** | **{avg['F-measure']:.4f}** | "
+                       f"**{avg['E-measure']:.4f}** | **{avg['MAE']:.4f}** | "
+                       f"**{avg['IoU']:.4f}** | **IoU: +{imp_iou:.2f}%, F1: +{imp_f1:.2f}%** |\n")
+
+        else:
+            # Standard results (no threshold optimization)
+            # Main metrics table
+            f.write("## Primary Metrics\n\n")
+            f.write("| Dataset | S-measure ⭐ | F-measure | E-measure | MAE ↓ | IoU |\n")
+            f.write("|---------|-------------|-----------|-----------|-------|-----|\n")
+
+            for dataset_name, metrics in results.items():
+                if dataset_name != 'average':
+                    f.write(f"| {dataset_name:11} | {metrics['S-measure']:.4f} | "
+                           f"{metrics['F-measure']:.4f} | {metrics['E-measure']:.4f} | "
+                           f"{metrics['MAE']:.4f} | {metrics['IoU']:.4f} |\n")
+
+            # Average row
+            if 'average' in results:
+                avg = results['average']
+                f.write(f"| **Average** | **{avg['S-measure']:.4f}** | "
+                       f"**{avg['F-measure']:.4f}** | **{avg['E-measure']:.4f}** | "
+                       f"**{avg['MAE']:.4f}** | **{avg['IoU']:.4f}** |\n")
+
+            # Additional metrics table
+            f.write("\n## Additional Metrics\n\n")
+            f.write("| Dataset | Precision | Recall | Dice Score | Pixel Acc | Specificity |\n")
+            f.write("|---------|-----------|--------|------------|-----------|-------------|\n")
+
+            for dataset_name, metrics in results.items():
+                if dataset_name != 'average':
+                    f.write(f"| {dataset_name:11} | {metrics['Precision']:.4f} | "
+                           f"{metrics['Recall']:.4f} | {metrics['Dice_Score']:.4f} | "
+                           f"{metrics['Pixel_Accuracy']:.4f} | {metrics['Specificity']:.4f} |\n")
+
+            # Average row
+            if 'average' in results:
+                avg = results['average']
+                f.write(f"| **Average** | **{avg['Precision']:.4f}** | "
+                       f"**{avg['Recall']:.4f}** | **{avg['Dice_Score']:.4f}** | "
                    f"**{avg['Pixel_Accuracy']:.4f}** | **{avg['Specificity']:.4f}** |\n")
 
         # Notes
@@ -1242,6 +1313,8 @@ def main():
                        help='Enable Test-Time Augmentation (multi-scale + flip)')
     parser.add_argument('--threshold', type=float, default=0.5,
                        help='Threshold for binary prediction (default: 0.5)')
+    parser.add_argument('--optimize-threshold', action='store_true',
+                       help='Find optimal threshold per dataset using grid search')
     parser.add_argument('--save-predictions', action='store_true',
                        help='Save prediction masks to output directory')
     parser.add_argument('--save-visualizations', action='store_true',
@@ -1270,6 +1343,9 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Datasets: {', '.join(args.datasets)}")
     print(f"TTA: {'Enabled' if args.tta else 'Disabled'}")
+    print(f"Threshold Optimization: {'Enabled' if args.optimize_threshold else 'Disabled'}")
+    if not args.optimize_threshold:
+        print(f"  Binary threshold: {args.threshold}")
     print(f"Visualizations: {'Enabled' if args.save_visualizations else 'Disabled'}")
     if args.save_visualizations:
         print(f"  Vis samples per dataset: {args.num_vis_samples if args.num_vis_samples else 'All'}")
@@ -1312,25 +1388,93 @@ def main():
 
             # Evaluate
             pred_dir = output_dir / 'predictions' / dataset_name if args.save_predictions else None
-            metrics = evaluate_dataset(
-                model, dataset, device,
-                use_tta=args.tta,
-                threshold=args.threshold,
-                output_dir=pred_dir,
-                save_visualizations=args.save_visualizations,
-                num_vis_samples=args.num_vis_samples
-            )
 
-            # Store results
-            all_results[dataset_name] = metrics
+            if args.optimize_threshold:
+                # Collect predictions for threshold optimization
+                metrics, all_preds, all_gts = evaluate_dataset(
+                    model, dataset, device,
+                    use_tta=args.tta,
+                    threshold=args.threshold,
+                    output_dir=pred_dir,
+                    save_visualizations=args.save_visualizations,
+                    num_vis_samples=args.num_vis_samples,
+                    collect_for_optimization=True
+                )
 
-            # Print results
-            print(f"\n  Results for {dataset_name}:")
-            print(f"    S-measure: {metrics['S-measure']:.4f} ⭐")
-            print(f"    F-measure: {metrics['F-measure']:.4f}")
-            print(f"    E-measure: {metrics['E-measure']:.4f}")
-            print(f"    MAE:       {metrics['MAE']:.4f}")
-            print(f"    IoU:       {metrics['IoU']:.4f}")
+                # Print results with default threshold
+                print(f"\n  Results for {dataset_name} (threshold={args.threshold:.2f}):")
+                print(f"    S-measure: {metrics['S-measure']:.4f}")
+                print(f"    F-measure: {metrics['F-measure']:.4f}")
+                print(f"    E-measure: {metrics['E-measure']:.4f}")
+                print(f"    MAE:       {metrics['MAE']:.4f}")
+                print(f"    IoU:       {metrics['IoU']:.4f}")
+
+                # Optimize threshold
+                print(f"\n  Optimizing threshold for {dataset_name}...")
+                best_thr_iou, best_iou, iou_scores = ThresholdOptimizer.grid_search(
+                    all_preds, all_gts, metric='iou'
+                )
+                best_thr_f1, best_f1, f1_scores = ThresholdOptimizer.grid_search(
+                    all_preds, all_gts, metric='f1'
+                )
+
+                print(f"    Best threshold (IoU): {best_thr_iou:.2f} -> IoU={best_iou:.4f}")
+                print(f"    Best threshold (F1):  {best_thr_f1:.2f} -> F1={best_f1:.4f}")
+
+                # Re-evaluate with optimal threshold
+                print(f"\n  Re-evaluating with optimal threshold ({best_thr_iou:.2f})...")
+                metrics_optimal = evaluate_dataset(
+                    model, dataset, device,
+                    use_tta=args.tta,
+                    threshold=best_thr_iou,
+                    output_dir=None,  # Don't save predictions again
+                    save_visualizations=False,  # Don't save visualizations again
+                    collect_for_optimization=False
+                )
+
+                # Store both results
+                all_results[dataset_name] = {
+                    'default_threshold': args.threshold,
+                    'default_metrics': metrics,
+                    'optimal_threshold_iou': best_thr_iou,
+                    'optimal_threshold_f1': best_thr_f1,
+                    'optimal_metrics': metrics_optimal,
+                    'improvement_iou': (best_iou - metrics['IoU']) * 100,  # % improvement
+                    'improvement_f1': (best_f1 - metrics['F-measure']) * 100
+                }
+
+                # Print optimal results
+                print(f"\n  Results with optimal threshold ({best_thr_iou:.2f}):")
+                print(f"    S-measure: {metrics_optimal['S-measure']:.4f} ⭐")
+                print(f"    F-measure: {metrics_optimal['F-measure']:.4f}")
+                print(f"    E-measure: {metrics_optimal['E-measure']:.4f}")
+                print(f"    MAE:       {metrics_optimal['MAE']:.4f}")
+                print(f"    IoU:       {metrics_optimal['IoU']:.4f}")
+                print(f"\n  Improvement:")
+                print(f"    IoU: +{all_results[dataset_name]['improvement_iou']:.2f}%")
+                print(f"    F1:  +{all_results[dataset_name]['improvement_f1']:.2f}%")
+
+            else:
+                # Standard evaluation
+                metrics = evaluate_dataset(
+                    model, dataset, device,
+                    use_tta=args.tta,
+                    threshold=args.threshold,
+                    output_dir=pred_dir,
+                    save_visualizations=args.save_visualizations,
+                    num_vis_samples=args.num_vis_samples
+                )
+
+                # Store results
+                all_results[dataset_name] = metrics
+
+                # Print results
+                print(f"\n  Results for {dataset_name}:")
+                print(f"    S-measure: {metrics['S-measure']:.4f} ⭐")
+                print(f"    F-measure: {metrics['F-measure']:.4f}")
+                print(f"    E-measure: {metrics['E-measure']:.4f}")
+                print(f"    MAE:       {metrics['MAE']:.4f}")
+                print(f"    IoU:       {metrics['IoU']:.4f}")
 
         except Exception as e:
             print(f"❌ Error evaluating {dataset_name}: {e}")
@@ -1338,26 +1482,79 @@ def main():
 
     # Compute average metrics
     if len(all_results) > 0:
-        avg_metrics = {}
-        for metric_name in all_results[list(all_results.keys())[0]].keys():
-            avg_metrics[metric_name] = np.mean([
-                results[metric_name] for results in all_results.values()
-            ])
-        all_results['average'] = avg_metrics
+        if args.optimize_threshold:
+            # Average both default and optimal metrics
+            avg_default_metrics = {}
+            avg_optimal_metrics = {}
+            first_result = all_results[list(all_results.keys())[0]]
 
-        print(f"\n{'='*70}")
-        print("AVERAGE METRICS")
-        print(f"{'='*70}")
-        print(f"  S-measure: {avg_metrics['S-measure']:.4f} ⭐")
-        print(f"  F-measure: {avg_metrics['F-measure']:.4f}")
-        print(f"  E-measure: {avg_metrics['E-measure']:.4f}")
-        print(f"  MAE:       {avg_metrics['MAE']:.4f}")
-        print(f"  IoU:       {avg_metrics['IoU']:.4f}")
-        print(f"{'='*70}\n")
+            for metric_name in first_result['default_metrics'].keys():
+                avg_default_metrics[metric_name] = np.mean([
+                    results['default_metrics'][metric_name] for results in all_results.values()
+                ])
+                avg_optimal_metrics[metric_name] = np.mean([
+                    results['optimal_metrics'][metric_name] for results in all_results.values()
+                ])
+
+            avg_thr_iou = np.mean([r['optimal_threshold_iou'] for r in all_results.values()])
+            avg_thr_f1 = np.mean([r['optimal_threshold_f1'] for r in all_results.values()])
+            avg_improvement_iou = np.mean([r['improvement_iou'] for r in all_results.values()])
+            avg_improvement_f1 = np.mean([r['improvement_f1'] for r in all_results.values()])
+
+            all_results['average'] = {
+                'default_threshold': args.threshold,
+                'default_metrics': avg_default_metrics,
+                'optimal_threshold_iou': avg_thr_iou,
+                'optimal_threshold_f1': avg_thr_f1,
+                'optimal_metrics': avg_optimal_metrics,
+                'improvement_iou': avg_improvement_iou,
+                'improvement_f1': avg_improvement_f1
+            }
+
+            print(f"\n{'='*70}")
+            print("AVERAGE METRICS")
+            print(f"{'='*70}")
+            print(f"\nDefault threshold ({args.threshold:.2f}):")
+            print(f"  S-measure: {avg_default_metrics['S-measure']:.4f}")
+            print(f"  F-measure: {avg_default_metrics['F-measure']:.4f}")
+            print(f"  E-measure: {avg_default_metrics['E-measure']:.4f}")
+            print(f"  MAE:       {avg_default_metrics['MAE']:.4f}")
+            print(f"  IoU:       {avg_default_metrics['IoU']:.4f}")
+
+            print(f"\nOptimal threshold (avg: {avg_thr_iou:.2f} for IoU, {avg_thr_f1:.2f} for F1):")
+            print(f"  S-measure: {avg_optimal_metrics['S-measure']:.4f} ⭐")
+            print(f"  F-measure: {avg_optimal_metrics['F-measure']:.4f}")
+            print(f"  E-measure: {avg_optimal_metrics['E-measure']:.4f}")
+            print(f"  MAE:       {avg_optimal_metrics['MAE']:.4f}")
+            print(f"  IoU:       {avg_optimal_metrics['IoU']:.4f}")
+
+            print(f"\nAverage improvement:")
+            print(f"  IoU: +{avg_improvement_iou:.2f}%")
+            print(f"  F1:  +{avg_improvement_f1:.2f}%")
+            print(f"{'='*70}\n")
+
+        else:
+            # Standard average
+            avg_metrics = {}
+            for metric_name in all_results[list(all_results.keys())[0]].keys():
+                avg_metrics[metric_name] = np.mean([
+                    results[metric_name] for results in all_results.values()
+                ])
+            all_results['average'] = avg_metrics
+
+            print(f"\n{'='*70}")
+            print("AVERAGE METRICS")
+            print(f"{'='*70}")
+            print(f"  S-measure: {avg_metrics['S-measure']:.4f} ⭐")
+            print(f"  F-measure: {avg_metrics['F-measure']:.4f}")
+            print(f"  E-measure: {avg_metrics['E-measure']:.4f}")
+            print(f"  MAE:       {avg_metrics['MAE']:.4f}")
+            print(f"  IoU:       {avg_metrics['IoU']:.4f}")
+            print(f"{'='*70}\n")
 
     # Save results
     save_results_json(all_results, output_dir / 'results.json')
-    save_results_markdown(all_results, output_dir / 'results.md', args.checkpoint, args.tta)
+    save_results_markdown(all_results, output_dir / 'results.md', args.checkpoint, args.tta, args.optimize_threshold)
 
     print(f"\n✅ Evaluation complete! Results saved to: {output_dir}\n")
 
