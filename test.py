@@ -1187,7 +1187,16 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 name_list = names
 
             # Process each prediction in the batch
-            for pred, gt, name in zip(preds, gt_list, name_list):
+            for idx_in_batch, (pred, gt, name) in enumerate(zip(preds, gt_list, name_list)):
+                # DEBUG: Print prediction stats for first few images
+                if vis_count < 3:
+                    pred_np_debug = pred.squeeze().cpu().numpy()
+                    gt_np_debug = gt.squeeze().cpu().numpy()
+                    print(f"\n[DEBUG] Sample {name}:")
+                    print(f"  Pred range: [{pred_np_debug.min():.4f}, {pred_np_debug.max():.4f}], mean: {pred_np_debug.mean():.4f}")
+                    print(f"  GT range: [{gt_np_debug.min():.4f}, {gt_np_debug.max():.4f}], mean: {gt_np_debug.mean():.4f}")
+                    print(f"  GT unique values: {np.unique(gt_np_debug)[:10]}")
+
                 # Compute adaptive threshold per image if requested
                 sample_threshold = threshold
                 if threshold_method != 'fixed':
