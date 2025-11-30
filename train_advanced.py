@@ -306,7 +306,7 @@ def create_model(args, device, is_main_process):
 
     # Base model (ModelLevelMoE)
     model = ModelLevelMoE(
-        backbone=args.backbone,
+        backbone_name=args.backbone,
         num_experts=args.num_experts,
         top_k=args.top_k,
         pretrained=args.pretrained,
