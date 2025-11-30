@@ -879,21 +879,14 @@ class Visualizer:
         metrics_text = f"""
         Sample: {name}
 
-        Primary Metrics:
+        COD Metrics:
         ━━━━━━━━━━━━━━━━━━━━
-        S-measure: {metrics['S-measure']:.4f} ⭐
-        F-measure: {metrics['F-measure']:.4f}
-        E-measure: {metrics['E-measure']:.4f}
-        MAE:       {metrics['MAE']:.4f}
-        IoU:       {metrics['IoU']:.4f}
-
-        Accuracy Metrics:
-        ━━━━━━━━━━━━━━━━━━━━
-        Precision: {metrics['Precision']:.4f}
-        Recall:    {metrics['Recall']:.4f}
-        Dice:      {metrics['Dice_Score']:.4f}
-        Pixel Acc: {metrics['Pixel_Accuracy']:.4f}
-        Specific:  {metrics['Specificity']:.4f}
+        S-measure:   {metrics['S-measure']:.4f} ⭐
+        F-measure:   {metrics['F-measure']:.4f}
+        E-measure:   {metrics['E-measure']:.4f}
+        Weighted-F:  {metrics['Weighted-F']:.4f}
+        MAE:         {metrics['MAE']:.4f}
+        IoU:         {metrics['IoU']:.4f}
         """
 
         ax12.text(0.1, 0.5, metrics_text, fontsize=12, family='monospace',
@@ -1300,24 +1293,6 @@ def save_results_markdown(results, output_path, checkpoint_path, use_tta, optimi
                 f.write(f"| **Average** | **{avg['S-measure']:.4f}** | "
                        f"**{avg['F-measure']:.4f}** | **{avg['E-measure']:.4f}** | "
                        f"**{avg['MAE']:.4f}** | **{avg['IoU']:.4f}** |\n")
-
-            # Additional metrics table
-            f.write("\n## Additional Metrics\n\n")
-            f.write("| Dataset | Precision | Recall | Dice Score | Pixel Acc | Specificity |\n")
-            f.write("|---------|-----------|--------|------------|-----------|-------------|\n")
-
-            for dataset_name, metrics in results.items():
-                if dataset_name != 'average':
-                    f.write(f"| {dataset_name:11} | {metrics['Precision']:.4f} | "
-                           f"{metrics['Recall']:.4f} | {metrics['Dice_Score']:.4f} | "
-                           f"{metrics['Pixel_Accuracy']:.4f} | {metrics['Specificity']:.4f} |\n")
-
-            # Average row
-            if 'average' in results:
-                avg = results['average']
-                f.write(f"| **Average** | **{avg['Precision']:.4f}** | "
-                       f"**{avg['Recall']:.4f}** | **{avg['Dice_Score']:.4f}** | "
-                   f"**{avg['Pixel_Accuracy']:.4f}** | **{avg['Specificity']:.4f}** |\n")
 
         # Notes
         f.write("\n## Notes\n\n")
