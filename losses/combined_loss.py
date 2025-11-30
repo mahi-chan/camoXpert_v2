@@ -40,25 +40,25 @@ class FocalLoss(nn.Module):
             logits: [B, 1, H, W] - model output (NOT sigmoid)
             targets: [B, 1, H, W] - ground truth in [0, 1]
         """
-        # Apply sigmoid to get probabilities
-        probs = torch.sigmoid(logits)
-
         # Flatten for easier computation
-        probs = probs.view(-1)
-        targets = targets.view(-1)
+        logits_flat = logits.view(-1)
+        targets_flat = targets.view(-1)
 
-        # Binary cross entropy
-        bce = F.binary_cross_entropy(probs, targets, reduction='none')
+        # Binary cross entropy with logits (autocast-safe)
+        bce = F.binary_cross_entropy_with_logits(logits_flat, targets_flat, reduction='none')
 
-        # Focal term: (1 - p_t)^gamma
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        focal_weight = (1 - p_t) ** self.gamma
+        # Get probabilities for focal weighting (detached to save memory)
+        with torch.no_grad():
+            probs = torch.sigmoid(logits_flat)
+            # Focal term: (1 - p_t)^gamma
+            p_t = probs * targets_flat + (1 - probs) * (1 - targets_flat)
+            focal_weight = (1 - p_t) ** self.gamma
 
         # Alpha weighting
-        alpha_weight = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        alpha_weight = self.alpha * targets_flat + (1 - self.alpha) * (1 - targets_flat)
 
         # Positive pixel weighting (boost foreground importance)
-        pos_weight_tensor = self.pos_weight * targets + 1.0 * (1 - targets)
+        pos_weight_tensor = self.pos_weight * targets_flat + 1.0 * (1 - targets_flat)
 
         # Combined focal loss
         focal_loss = alpha_weight * focal_weight * pos_weight_tensor * bce
@@ -140,9 +140,6 @@ class BoundaryLoss(nn.Module):
             logits: [B, 1, H, W] - model output (NOT sigmoid)
             targets: [B, 1, H, W] - ground truth in [0, 1]
         """
-        # Apply sigmoid
-        probs = torch.sigmoid(logits)
-
         # Detect boundaries in GT using Laplacian
         boundaries = torch.abs(F.conv2d(
             targets,
@@ -156,8 +153,8 @@ class BoundaryLoss(nn.Module):
         # Create boundary weight map (1.0 + 2.0 * boundary_strength)
         boundary_weights = 1.0 + 2.0 * boundaries
 
-        # Weighted BCE at boundaries
-        bce = F.binary_cross_entropy(probs, targets, reduction='none')
+        # Weighted BCE with logits (autocast-safe)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         weighted_bce = bce * boundary_weights
 
         return weighted_bce.mean()
