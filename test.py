@@ -494,15 +494,26 @@ class CODTestDataset(Dataset):
             img1.png
             img2.png
             ...
+
+    Alternatively, can specify image_dir and gt_dir directly.
     """
 
-    def __init__(self, root, image_size=352):
-        self.root = Path(root)
+    def __init__(self, root=None, image_size=352, image_dir=None, gt_dir=None):
         self.image_size = image_size
 
-        # Find image and GT directories
-        self.image_dir = self.root / 'Images' if (self.root / 'Images').exists() else self.root / 'Imgs'
-        self.gt_dir = self.root / 'GT'
+        # Support two modes: root directory OR explicit image_dir/gt_dir
+        if image_dir is not None and gt_dir is not None:
+            # Explicit paths provided
+            self.image_dir = Path(image_dir)
+            self.gt_dir = Path(gt_dir)
+            self.root = self.image_dir.parent  # For display purposes
+        elif root is not None:
+            # Root directory provided - use subdirectories
+            self.root = Path(root)
+            self.image_dir = self.root / 'Images' if (self.root / 'Images').exists() else self.root / 'Imgs'
+            self.gt_dir = self.root / 'GT'
+        else:
+            raise ValueError("Must provide either root OR both image_dir and gt_dir")
 
         if not self.image_dir.exists():
             raise ValueError(f"Image directory not found: {self.image_dir}")
@@ -1327,13 +1338,31 @@ def main():
                        help='Number of experts in the model (default: 4)')
 
     # Data arguments
-    parser.add_argument('--data-root', type=str, required=True,
-                       help='Root directory containing test datasets')
+    parser.add_argument('--data-root', type=str, default=None,
+                       help='Root directory containing test datasets (optional if using individual dataset paths)')
     parser.add_argument('--datasets', nargs='+',
                        default=['COD10K', 'CHAMELEON', 'CAMO', 'NC4K'],
                        help='Datasets to evaluate on (default: all)')
     parser.add_argument('--image-size', type=int, default=352,
                        help='Input image size (default: 352)')
+
+    # Individual dataset paths (alternative to --data-root)
+    parser.add_argument('--cod10k-img', type=str, default=None,
+                       help='Path to COD10K test images directory')
+    parser.add_argument('--cod10k-gt', type=str, default=None,
+                       help='Path to COD10K test ground truth directory')
+    parser.add_argument('--chameleon-img', type=str, default=None,
+                       help='Path to CHAMELEON images directory')
+    parser.add_argument('--chameleon-gt', type=str, default=None,
+                       help='Path to CHAMELEON ground truth directory')
+    parser.add_argument('--camo-img', type=str, default=None,
+                       help='Path to CAMO test images directory')
+    parser.add_argument('--camo-gt', type=str, default=None,
+                       help='Path to CAMO test ground truth directory')
+    parser.add_argument('--nc4k-img', type=str, default=None,
+                       help='Path to NC4K images directory')
+    parser.add_argument('--nc4k-gt', type=str, default=None,
+                       help='Path to NC4K ground truth directory')
 
     # Evaluation arguments
     parser.add_argument('--tta', action='store_true',
@@ -1363,6 +1392,38 @@ def main():
                        help='Device to use (default: cuda)')
 
     args = parser.parse_args()
+
+    # Build dataset_paths dict from individual arguments
+    dataset_paths = {}
+    dataset_config = {
+        'COD10K': (args.cod10k_img, args.cod10k_gt),
+        'CHAMELEON': (args.chameleon_img, args.chameleon_gt),
+        'CAMO': (args.camo_img, args.camo_gt),
+        'NC4K': (args.nc4k_img, args.nc4k_gt),
+    }
+
+    for dataset_name, (img_path, gt_path) in dataset_config.items():
+        if img_path is not None and gt_path is not None:
+            # Check if paths exist
+            img_path_obj = Path(img_path)
+            gt_path_obj = Path(gt_path)
+            if img_path_obj.exists() and gt_path_obj.exists():
+                dataset_paths[dataset_name] = {
+                    'image_dir': img_path,
+                    'gt_dir': gt_path
+                }
+
+    # Validate configuration
+    if args.data_root is None and len(dataset_paths) == 0:
+        raise ValueError("Must provide either --data-root OR individual dataset paths (e.g., --cod10k-img and --cod10k-gt)")
+
+    # Filter datasets to only those available
+    if len(dataset_paths) > 0:
+        # Using individual paths - only evaluate datasets with provided paths
+        available_datasets = [d for d in args.datasets if d in dataset_paths]
+        if len(available_datasets) == 0:
+            raise ValueError(f"No datasets available. Requested: {args.datasets}, Available: {list(dataset_paths.keys())}")
+        args.datasets = available_datasets
 
     # Setup
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -1411,28 +1472,44 @@ def main():
         print(f"Dataset: {dataset_name}")
         print(f"{'='*70}")
 
-        # Find dataset path
-        dataset_path = Path(args.data_root) / dataset_name
-
-        # Handle different naming conventions
-        if not dataset_path.exists():
-            # Try with -v3 suffix (e.g., COD10K-v3)
-            dataset_path = Path(args.data_root) / f"{dataset_name}-v3"
-
-        if not dataset_path.exists():
-            print(f"⚠️  Dataset not found: {dataset_path}")
-            print(f"    Skipping {dataset_name}...")
-            continue
-
-        # For COD10K, CAMO, NC4K, use Test subdirectory
-        if dataset_name in ['COD10K', 'CAMO', 'NC4K']:
-            test_path = dataset_path / 'Test'
-            if test_path.exists():
-                dataset_path = test_path
-
         try:
-            # Create dataset
-            dataset = CODTestDataset(dataset_path, image_size=args.image_size)
+            # Create dataset using individual paths or data_root
+            if dataset_name in dataset_paths:
+                # Use individual paths
+                paths = dataset_paths[dataset_name]
+                print(f"  Using custom paths:")
+                print(f"    Images: {paths['image_dir']}")
+                print(f"    GT:     {paths['gt_dir']}")
+                dataset = CODTestDataset(
+                    image_size=args.image_size,
+                    image_dir=paths['image_dir'],
+                    gt_dir=paths['gt_dir']
+                )
+            elif args.data_root is not None:
+                # Use data_root directory structure
+                dataset_path = Path(args.data_root) / dataset_name
+
+                # Handle different naming conventions
+                if not dataset_path.exists():
+                    # Try with -v3 suffix (e.g., COD10K-v3)
+                    dataset_path = Path(args.data_root) / f"{dataset_name}-v3"
+
+                if not dataset_path.exists():
+                    print(f"⚠️  Dataset not found: {dataset_path}")
+                    print(f"    Skipping {dataset_name}...")
+                    continue
+
+                # For COD10K, CAMO, NC4K, use Test subdirectory
+                if dataset_name in ['COD10K', 'CAMO', 'NC4K']:
+                    test_path = dataset_path / 'Test'
+                    if test_path.exists():
+                        dataset_path = test_path
+
+                dataset = CODTestDataset(dataset_path, image_size=args.image_size)
+            else:
+                print(f"⚠️  No path configured for {dataset_name}")
+                print(f"    Skipping...")
+                continue
 
             # Evaluate
             pred_dir = output_dir / 'predictions' / dataset_name if args.save_predictions else None
