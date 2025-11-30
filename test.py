@@ -968,7 +968,7 @@ class Visualizer:
         return outputs
 
 
-def load_checkpoint(checkpoint_path, num_experts=4, device='cuda'):
+def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparallel=True):
     """
     Load model from checkpoint, handling DDP 'module.' prefix.
 
@@ -976,6 +976,7 @@ def load_checkpoint(checkpoint_path, num_experts=4, device='cuda'):
         checkpoint_path: Path to checkpoint file
         num_experts: Number of experts in the model
         device: Device to load model on
+        use_dataparallel: Whether to use DataParallel for multi-GPU inference
 
     Returns:
         Loaded model in eval mode
@@ -1018,6 +1019,11 @@ def load_checkpoint(checkpoint_path, num_experts=4, device='cuda'):
     model.load_state_dict(new_state_dict, strict=True)
     model = model.to(device)
     model.eval()
+
+    # Use DataParallel for multi-GPU inference if available
+    if use_dataparallel and torch.cuda.device_count() > 1:
+        print(f"✓ Using DataParallel with {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
 
     print(f"✓ Model loaded successfully")
     print(f"{'='*70}\n")
@@ -1082,7 +1088,8 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
 
 def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, threshold=0.5,
                      threshold_method='fixed', output_dir=None,
-                     save_visualizations=False, num_vis_samples=None, collect_for_optimization=False):
+                     save_visualizations=False, num_vis_samples=None, collect_for_optimization=False,
+                     batch_size=1):
     """
     Evaluate model on a dataset.
 
@@ -1098,11 +1105,18 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
         save_visualizations: Whether to save visualizations
         num_vis_samples: Number of samples to visualize (None = all)
         collect_for_optimization: If True, collect all predictions and GTs for threshold optimization
+        batch_size: Batch size for evaluation (only effective when TTA/CRF disabled)
 
     Returns:
         Dictionary of computed metrics (and optionally lists of predictions and GTs)
     """
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
+    # Force batch_size=1 if using TTA or CRF (they require per-image processing)
+    if use_tta or use_crf:
+        actual_batch_size = 1
+    else:
+        actual_batch_size = batch_size
+
+    dataloader = DataLoader(dataset, batch_size=actual_batch_size, shuffle=False, num_workers=4)
     metrics = CODMetrics()
 
     # Create output directory if saving predictions
@@ -1123,80 +1137,108 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=f"  Evaluating {dataset.root.name}"):
-            image = batch['image'].to(device)
-            gt = batch['gt'].to(device)
-            name = batch['name'][0]
+            images = batch['image'].to(device)
+            gts = batch['gt'].to(device)
+            names = batch['name']
 
-            # Forward pass
-            if use_tta:
-                pred = test_time_augmentation(model, image)
+            current_batch_size = images.size(0)
+
+            # Forward pass (batch processing when TTA/CRF disabled)
+            if use_tta or use_crf:
+                # Process one image at a time for TTA/CRF
+                assert current_batch_size == 1, "TTA/CRF requires batch_size=1"
+                image = images
+                gt = gts
+                name = names[0]
+
+                if use_tta:
+                    pred = test_time_augmentation(model, image)
+                else:
+                    pred = model(image)
+
+                pred = torch.sigmoid(pred)
+
+                if use_crf:
+                    img_for_crf = image.squeeze(0)
+                    pred_refined = crf_refiner.refine(img_for_crf, pred)
+                    pred = torch.from_numpy(pred_refined).unsqueeze(0).unsqueeze(0).to(device)
+
+                # Process as single item
+                preds = [pred]
+                gt_list = [gt]
+                name_list = [name]
             else:
-                pred = model(image)
+                # Batch forward pass
+                preds_batch = model(images)
+                preds_batch = torch.sigmoid(preds_batch)
 
-            # Apply sigmoid
-            pred = torch.sigmoid(pred)
+                # Split batch into individual predictions
+                preds = [preds_batch[i:i+1] for i in range(current_batch_size)]
+                gt_list = [gts[i:i+1] for i in range(current_batch_size)]
+                name_list = names
 
-            # Apply CRF refinement if requested
-            if use_crf:
-                # CRF refiner expects image and probability map
-                # Denormalize image for CRF
-                img_for_crf = image.squeeze(0)  # [C, H, W]
-                pred_refined = crf_refiner.refine(img_for_crf, pred)
-                # Convert back to tensor
-                pred = torch.from_numpy(pred_refined).unsqueeze(0).unsqueeze(0).to(device)
+            # Process each prediction in the batch
+            for pred, gt, name in zip(preds, gt_list, name_list):
+                # Compute adaptive threshold per image if requested
+                sample_threshold = threshold
+                if threshold_method != 'fixed':
+                    pred_np_for_thresh = pred.squeeze().cpu().numpy()
+                    if threshold_method == 'otsu':
+                        sample_threshold = ThresholdOptimizer.otsu(pred_np_for_thresh)
+                    elif threshold_method == 'adaptive-mean':
+                        sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='mean')
+                    elif threshold_method == 'adaptive-median':
+                        sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='median')
 
-            # Compute adaptive threshold per image if requested
-            sample_threshold = threshold  # Default
-            if threshold_method != 'fixed':
-                pred_np_for_thresh = pred.squeeze().cpu().numpy()
-                if threshold_method == 'otsu':
-                    sample_threshold = ThresholdOptimizer.otsu(pred_np_for_thresh)
-                elif threshold_method == 'adaptive-mean':
-                    sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='mean')
-                elif threshold_method == 'adaptive-median':
-                    sample_threshold = ThresholdOptimizer.adaptive(pred_np_for_thresh, method='median')
+                # Collect for threshold optimization if requested
+                if collect_for_optimization:
+                    pred_np = pred.squeeze().cpu().numpy()
+                    gt_np = gt.squeeze().cpu().numpy()
+                    all_preds.append(pred_np)
+                    all_gts.append(gt_np)
 
-            # Collect for threshold optimization if requested
-            if collect_for_optimization:
-                pred_np = pred.squeeze().cpu().numpy()
-                gt_np = gt.squeeze().cpu().numpy()
-                all_preds.append(pred_np)
-                all_gts.append(gt_np)
+                # Compute metrics for this sample
+                sample_metrics = CODMetrics()
+                sample_metrics.update(pred, gt, threshold=sample_threshold)
+                sample_metrics_dict = sample_metrics.compute()
 
-            # Compute metrics for this sample
-            sample_metrics = CODMetrics()
-            sample_metrics.update(pred, gt, threshold=sample_threshold)
-            sample_metrics_dict = sample_metrics.compute()
+                # Update overall metrics
+                metrics.update(pred, gt, threshold=sample_threshold)
 
-            # Update overall metrics
-            metrics.update(pred, gt, threshold=sample_threshold)
+                # Save prediction if requested
+                if output_dir is not None:
+                    pred_np = (pred.squeeze().cpu().numpy() * 255).astype(np.uint8)
+                    pred_img = Image.fromarray(pred_np)
+                    pred_img.save(output_dir / f"{name}.png")
 
-            # Save prediction if requested
-            if output_dir is not None:
-                pred_np = (pred.squeeze().cpu().numpy() * 255).astype(np.uint8)
-                pred_img = Image.fromarray(pred_np)
-                pred_img.save(output_dir / f"{name}.png")
+                # Save visualizations if requested
+                if save_visualizations and (num_vis_samples is None or vis_count < num_vis_samples):
+                    vis_dir = output_dir.parent / 'visualizations' / dataset.root.name if output_dir else Path('visualizations') / dataset.root.name
 
-            # Save visualizations if requested
-            if save_visualizations and (num_vis_samples is None or vis_count < num_vis_samples):
-                vis_dir = output_dir.parent / 'visualizations' / dataset.root.name if output_dir else Path('visualizations') / dataset.root.name
+                    # Get the original image for this sample
+                    if use_tta or use_crf:
+                        img_tensor = images.squeeze(0)
+                    else:
+                        # Find the index in the original batch
+                        idx = name_list.index(name)
+                        img_tensor = images[idx]
 
-                # Save comparison figure
-                fig = visualizer.create_comparison_figure(
-                    image.squeeze(0), pred, gt, sample_metrics_dict, name, sample_threshold
-                )
-                fig_path = vis_dir / 'figures'
-                fig_path.mkdir(parents=True, exist_ok=True)
-                fig.savefig(fig_path / f"{name}_comparison.png", dpi=150, bbox_inches='tight')
-                plt.close(fig)
+                    # Save comparison figure
+                    fig = visualizer.create_comparison_figure(
+                        img_tensor, pred, gt, sample_metrics_dict, name, sample_threshold
+                    )
+                    fig_path = vis_dir / 'figures'
+                    fig_path.mkdir(parents=True, exist_ok=True)
+                    fig.savefig(fig_path / f"{name}_comparison.png", dpi=150, bbox_inches='tight')
+                    plt.close(fig)
 
-                # Save individual outputs
-                individual_dir = vis_dir / 'individual' / name
-                visualizer.save_individual_outputs(
-                    image.squeeze(0), pred, gt, name, individual_dir, sample_threshold
-                )
+                    # Save individual outputs
+                    individual_dir = vis_dir / 'individual' / name
+                    visualizer.save_individual_outputs(
+                        img_tensor, pred, gt, name, individual_dir, sample_threshold
+                    )
 
-                vis_count += 1
+                    vis_count += 1
 
     # Compute final metrics
     final_metrics = metrics.compute()
@@ -1340,6 +1382,10 @@ def main():
                        help='Path to NC4K ground truth directory')
 
     # Evaluation arguments
+    parser.add_argument('--batch-size', type=int, default=1,
+                       help='Batch size for evaluation (default: 1, use 8-16 for faster testing)')
+    parser.add_argument('--fast', action='store_true',
+                       help='Fast mode: disable TTA, CRF, and visualizations for maximum speed')
     parser.add_argument('--tta', action='store_true',
                        help='Enable Test-Time Augmentation (multi-scale + flip)')
     parser.add_argument('--use-crf', action='store_true',
@@ -1367,6 +1413,13 @@ def main():
                        help='Device to use (default: cuda)')
 
     args = parser.parse_args()
+
+    # Handle fast mode
+    if args.fast:
+        print("\n⚡ FAST MODE ENABLED - Disabling TTA, CRF, and visualizations for maximum speed")
+        args.tta = False
+        args.use_crf = False
+        args.save_visualizations = False
 
     # Build dataset_paths dict from individual arguments
     dataset_paths = {}
@@ -1419,6 +1472,11 @@ def main():
     print("="*70)
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Datasets: {', '.join(args.datasets)}")
+    print(f"Batch size: {args.batch_size}")
+    if torch.cuda.device_count() > 1:
+        print(f"GPUs: {torch.cuda.device_count()} (DataParallel enabled)")
+    else:
+        print(f"GPUs: {torch.cuda.device_count()}")
     print(f"TTA: {'Enabled' if args.tta else 'Disabled'}")
     print(f"CRF Refinement: {'Enabled' if args.use_crf else 'Disabled'}")
     if args.use_crf:
@@ -1510,7 +1568,8 @@ def main():
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
                     num_vis_samples=args.num_vis_samples,
-                    collect_for_optimization=True
+                    collect_for_optimization=True,
+                    batch_size=args.batch_size
                 )
 
                 # Print results with default threshold
@@ -1543,7 +1602,8 @@ def main():
                     threshold_method='fixed',  # Use optimized fixed threshold
                     output_dir=None,  # Don't save predictions again
                     save_visualizations=False,  # Don't save visualizations again
-                    collect_for_optimization=False
+                    collect_for_optimization=False,
+                    batch_size=args.batch_size
                 )
 
                 # Store both results
@@ -1578,7 +1638,8 @@ def main():
                     threshold_method=args.threshold_method,
                     output_dir=pred_dir,
                     save_visualizations=args.save_visualizations,
-                    num_vis_samples=args.num_vis_samples
+                    num_vis_samples=args.num_vis_samples,
+                    batch_size=args.batch_size
                 )
 
                 # Store results
