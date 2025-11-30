@@ -47,7 +47,7 @@ class ModelLevelMoE(nn.Module):
     4. Better generalization through specialization
     """
 
-    def __init__(self, backbone='pvt_v2_b2', num_experts=4, top_k=2,
+    def __init__(self, backbone_name='pvt_v2_b2', num_experts=4, top_k=2,
                  pretrained=True, use_deep_supervision=False):
         super().__init__()
 
@@ -66,9 +66,9 @@ class ModelLevelMoE(nn.Module):
         # SHARED BACKBONE: Extract features once
         # ============================================================
         print("\n[1/3] Loading shared backbone...")
-        self.backbone = self._create_backbone(backbone, pretrained)
-        self.feature_dims = self._get_feature_dims(backbone)
-        print(f"✓ Backbone: {backbone}")
+        self.backbone = self._create_backbone(backbone_name, pretrained)
+        self.feature_dims = self._get_feature_dims(backbone_name)
+        print(f"✓ Backbone: {backbone_name}")
         print(f"✓ Feature dims: {self.feature_dims}")
 
         # ============================================================
@@ -284,7 +284,7 @@ if __name__ == '__main__':
 
     # Create model
     model = ModelLevelMoE(
-        backbone='pvt_v2_b2',
+        backbone_name='pvt_v2_b2',
         num_experts=4,
         top_k=2,
         pretrained=False

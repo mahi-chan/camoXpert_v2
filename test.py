@@ -445,7 +445,8 @@ class TTAPredictor:
                 scaled_img = image
 
             # Forward pass
-            pred = self.model(scaled_img)
+            output = self.model(scaled_img)
+            pred = output['pred'] if isinstance(output, dict) else (output[0] if isinstance(output, tuple) else output)
 
             # Resize back to original size
             if scale != 1.0:
@@ -459,7 +460,8 @@ class TTAPredictor:
                 flipped_img = torch.flip(scaled_img, dims=[3])
 
                 # Forward pass on flipped image
-                pred_flip = self.model(flipped_img)
+                output_flip = self.model(flipped_img)
+                pred_flip = output_flip['pred'] if isinstance(output_flip, dict) else (output_flip[0] if isinstance(output_flip, tuple) else output_flip)
 
                 # Resize back if needed
                 if scale != 1.0:
@@ -1008,11 +1010,10 @@ def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparal
 
     # Create model
     model = ModelLevelMoE(
-        backbone='pvt_v2_b2',
+        backbone_name='pvt_v2_b2',
         num_experts=num_experts,
         top_k=2,
-        pretrained=False,
-        use_deep_supervision=False
+        pretrained=False
     )
 
     # Load state dict
@@ -1057,7 +1058,8 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
 
         # Forward pass
         with torch.no_grad():
-            pred = model(scaled_img)
+            output = model(scaled_img)
+            pred = output['pred'] if isinstance(output, dict) else (output[0] if isinstance(output, tuple) else output)
 
             # Resize back to original size
             if scale != 1.0:
@@ -1070,7 +1072,8 @@ def test_time_augmentation(model, image, scales=[0.75, 1.0, 1.25], use_flip=True
             flipped_img = torch.flip(scaled_img, dims=[3])  # Horizontal flip
 
             with torch.no_grad():
-                pred_flip = model(flipped_img)
+                output_flip = model(flipped_img)
+                pred_flip = output_flip['pred'] if isinstance(output_flip, dict) else (output_flip[0] if isinstance(output_flip, tuple) else output_flip)
 
                 # Resize back
                 if scale != 1.0:
@@ -1163,7 +1166,8 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 if use_tta:
                     pred = test_time_augmentation(model, image)
                 else:
-                    pred = model(image)
+                    output = model(image)
+                    pred = output['pred'] if isinstance(output, dict) else (output[0] if isinstance(output, tuple) else output)
 
                 pred = torch.sigmoid(pred)
 
@@ -1178,7 +1182,8 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 name_list = [name]
             else:
                 # Batch forward pass
-                preds_batch = model(images)
+                output_batch = model(images)
+                preds_batch = output_batch['pred'] if isinstance(output_batch, dict) else (output_batch[0] if isinstance(output_batch, tuple) else output_batch)
                 preds_batch = torch.sigmoid(preds_batch)
 
                 # Split batch into individual predictions
