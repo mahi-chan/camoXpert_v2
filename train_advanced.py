@@ -46,6 +46,8 @@ from pathlib import Path
 # Import new modules
 from trainers.optimized_trainer import OptimizedTrainer
 from losses.composite_loss import CompositeLossSystem
+from losses import CombinedLoss  # NEW: Anti-under-segmentation loss
+from utils.ema import EMA  # NEW: Exponential Moving Average
 from data.dataset import COD10KDataset
 from metrics.cod_metrics import CODMetrics
 from models.model_level_moe import ModelLevelMoE
@@ -120,10 +122,14 @@ def parse_args():
     parser.add_argument('--router-warmup-epochs', type=int, default=15,
                         help='Number of epochs to keep router frozen (default: 15)')
 
-    # CompositeLoss settings
+    # Loss Function Selection
+    parser.add_argument('--use-combined-loss', action='store_true',
+                        help='Use new CombinedLoss (Tversky+Focal+Boundary+SSIM+Dice) to fix under-segmentation')
+
+    # CompositeLoss settings (default loss function)
     parser.add_argument('--loss-scheme', type=str, default='progressive',
                         choices=['progressive', 'full'],
-                        help='Loss weighting scheme (default: progressive)')
+                        help='Loss weighting scheme for CompositeLoss (default: progressive)')
     parser.add_argument('--boundary-lambda-start', type=float, default=0.5,
                         help='Starting weight for boundary loss (default: 0.5)')
     parser.add_argument('--boundary-lambda-end', type=float, default=2.0,
@@ -134,6 +140,30 @@ def parse_args():
                         help='Weight for small object scale loss (default: 2.0)')
     parser.add_argument('--uncertainty-threshold', type=float, default=0.5,
                         help='Threshold for uncertainty loss (default: 0.5)')
+
+    # CombinedLoss settings (when --use-combined-loss is enabled)
+    parser.add_argument('--focal-weight', type=float, default=1.0,
+                        help='Weight for focal loss in CombinedLoss (default: 1.0)')
+    parser.add_argument('--tversky-weight', type=float, default=2.0,
+                        help='Weight for Tversky loss ⭐ HIGH fixes under-segmentation (default: 2.0)')
+    parser.add_argument('--combined-boundary-weight', type=float, default=1.0,
+                        help='Weight for boundary loss in CombinedLoss (default: 1.0)')
+    parser.add_argument('--ssim-weight', type=float, default=0.5,
+                        help='Weight for SSIM loss in CombinedLoss (default: 0.5)')
+    parser.add_argument('--dice-weight', type=float, default=1.0,
+                        help='Weight for Dice loss in CombinedLoss (default: 1.0)')
+    parser.add_argument('--pos-weight', type=float, default=3.0,
+                        help='Positive pixel weight in focal loss (default: 3.0, boosts foreground)')
+    parser.add_argument('--tversky-alpha', type=float, default=0.3,
+                        help='Tversky alpha (FP weight) (default: 0.3)')
+    parser.add_argument('--tversky-beta', type=float, default=0.7,
+                        help='Tversky beta (FN weight) ⭐ HIGH penalizes under-segmentation (default: 0.7)')
+
+    # EMA settings
+    parser.add_argument('--use-ema', action='store_true',
+                        help='Use Exponential Moving Average for model weights')
+    parser.add_argument('--ema-decay', type=float, default=0.999,
+                        help='EMA decay rate (default: 0.999)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints_advanced',
@@ -374,23 +404,61 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         betas=(0.9, 0.999)
     )
 
-    # Advanced CompositeLoss (progressive weighting is always enabled)
-    criterion = CompositeLossSystem(
-        total_epochs=args.epochs,
-        use_boundary=True,
-        use_frequency=True,
-        use_scale_adaptive=True,
-        use_uncertainty=True,
-        boundary_lambda_start=args.boundary_lambda_start,
-        boundary_lambda_end=args.boundary_lambda_end,
-        frequency_weight=args.frequency_weight,
-        scale_small_weight=args.scale_small_weight,
-        uncertainty_threshold=args.uncertainty_threshold
-    )
+    # Choose loss function based on --use-combined-loss flag
+    if args.use_combined_loss:
+        # NEW: CombinedLoss - Fixes under-segmentation with TverskyLoss (beta=0.7)
+        combined_loss_fn = CombinedLoss(
+            focal_weight=args.focal_weight,
+            tversky_weight=args.tversky_weight,
+            boundary_weight=args.combined_boundary_weight,
+            ssim_weight=args.ssim_weight,
+            dice_weight=args.dice_weight,
+            pos_weight=args.pos_weight
+        )
 
-    if is_main_process:
-        print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
-        print(f"✓ Loss: CompositeLoss ({args.loss_scheme} scheme)")
+        # Wrapper to make CombinedLoss compatible with trainer interface
+        # CombinedLoss returns (total_loss, loss_dict) but trainer expects just loss
+        class CombinedLossWrapper:
+            def __init__(self, loss_fn):
+                self.loss_fn = loss_fn
+                self.last_loss_dict = {}
+
+            def __call__(self, predictions, targets, input_image=None):
+                """Call loss function and return only total loss"""
+                total_loss, loss_dict = self.loss_fn(predictions, targets)
+                self.last_loss_dict = loss_dict  # Store for logging
+                return total_loss
+
+            def update_epoch(self, epoch, total_epochs):
+                """Dummy method for compatibility with CompositeLoss"""
+                pass
+
+        criterion = CombinedLossWrapper(combined_loss_fn)
+
+        if is_main_process:
+            print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
+            print(f"✓ Loss: CombinedLoss (Anti-Under-Segmentation)")
+            print(f"    Focal={args.focal_weight}, Tversky={args.tversky_weight} ⭐")
+            print(f"    Boundary={args.combined_boundary_weight}, SSIM={args.ssim_weight}, Dice={args.dice_weight}")
+            print(f"    pos_weight={args.pos_weight}, tversky_β={args.tversky_beta} (penalizes FN)")
+    else:
+        # DEFAULT: Advanced CompositeLoss (progressive weighting is always enabled)
+        criterion = CompositeLossSystem(
+            total_epochs=args.epochs,
+            use_boundary=True,
+            use_frequency=True,
+            use_scale_adaptive=True,
+            use_uncertainty=True,
+            boundary_lambda_start=args.boundary_lambda_start,
+            boundary_lambda_end=args.boundary_lambda_end,
+            frequency_weight=args.frequency_weight,
+            scale_small_weight=args.scale_small_weight,
+            uncertainty_threshold=args.uncertainty_threshold
+        )
+
+        if is_main_process:
+            print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
+            print(f"✓ Loss: CompositeLoss ({args.loss_scheme} scheme)")
 
     return optimizer, criterion
 
