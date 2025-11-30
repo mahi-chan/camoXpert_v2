@@ -1219,6 +1219,26 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
                 # Update overall metrics
                 metrics.update(pred, gt, threshold=sample_threshold)
 
+            # DEBUG: Print first 3 samples
+            if vis_count < 3:
+                pred_np_debug = pred.squeeze().cpu().numpy()
+                gt_np_debug = gt.squeeze().cpu().numpy()
+                
+                # Compute IoU manually for verification
+                pred_bin = (pred_np_debug > 0.5).astype(np.float32)
+                gt_bin = (gt_np_debug > 0.5).astype(np.float32)
+                intersection = (pred_bin * gt_bin).sum()
+                union = pred_bin.sum() + gt_bin.sum() - intersection
+                manual_iou = intersection / (union + 1e-8)
+                
+                print(f"\n[DEBUG] Sample {name}:")
+                print(f"  Pred range: [{pred_np_debug.min():.4f}, {pred_np_debug.max():.4f}]")
+                print(f"  GT range: [{gt_np_debug.min():.4f}, {gt_np_debug.max():.4f}]")
+                print(f"  Pred positive: {pred_bin.sum():.0f}, GT positive: {gt_bin.sum():.0f}")
+                print(f"  Manual IoU: {manual_iou:.4f}")
+                print(f"  Sample metrics: {sample_metrics_dict}")
+                vis_count += 1
+
                 # Save prediction if requested
                 if output_dir is not None:
                     pred_np = (pred.squeeze().cpu().numpy() * 255).astype(np.uint8)
@@ -1374,7 +1394,7 @@ def main():
     parser.add_argument('--datasets', nargs='+',
                        default=['COD10K', 'CHAMELEON', 'CAMO', 'NC4K'],
                        help='Datasets to evaluate on (default: all)')
-    parser.add_argument('--image-size', type=int, default=352,
+    parser.add_argument('--image-size', type=int, default=416,
                        help='Input image size (default: 352)')
 
     # Individual dataset paths (alternative to --data-root)
