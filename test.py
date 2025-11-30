@@ -1116,7 +1116,16 @@ def evaluate_dataset(model, dataset, device, use_tta=False, use_crf=False, thres
     else:
         actual_batch_size = batch_size
 
-    dataloader = DataLoader(dataset, batch_size=actual_batch_size, shuffle=False, num_workers=4)
+    # Optimized DataLoader for maximum GPU utilization
+    dataloader = DataLoader(
+        dataset,
+        batch_size=actual_batch_size,
+        shuffle=False,
+        num_workers=8,  # Increased for faster data loading
+        pin_memory=True,  # Faster GPU transfer
+        prefetch_factor=4,  # Prefetch more batches
+        persistent_workers=True  # Keep workers alive between iterations
+    )
     metrics = CODMetrics()
 
     # Create output directory if saving predictions
