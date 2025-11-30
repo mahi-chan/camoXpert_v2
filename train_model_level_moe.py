@@ -821,13 +821,13 @@ def main():
     if args.load_experts_from and args.stage >= 2:
         if is_main_process(args):
             print(f"\nLoading trained experts from: {args.load_experts_from}")
-        checkpoint = torch.load(args.load_experts_from, map_location=device)
+        checkpoint = torch.load(args.load_experts_from, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
     if args.resume_from:
         if is_main_process(args):
             print(f"\nResuming from: {args.resume_from}")
-        checkpoint = torch.load(args.resume_from, map_location=device)
+        checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
 
     # DDP
