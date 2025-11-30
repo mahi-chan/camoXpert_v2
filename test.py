@@ -1395,6 +1395,15 @@ def main():
 
     # Build dataset_paths dict from individual arguments
     dataset_paths = {}
+
+    # Debug: Print all dataset-related arguments
+    print("\n[DEBUG] Dataset path arguments:")
+    print(f"  COD10K:    img={getattr(args, 'cod10k_img', 'NOT FOUND')}, gt={getattr(args, 'cod10k_gt', 'NOT FOUND')}")
+    print(f"  CHAMELEON: img={getattr(args, 'chameleon_img', 'NOT FOUND')}, gt={getattr(args, 'chameleon_gt', 'NOT FOUND')}")
+    print(f"  CAMO:      img={getattr(args, 'camo_img', 'NOT FOUND')}, gt={getattr(args, 'camo_gt', 'NOT FOUND')}")
+    print(f"  NC4K:      img={getattr(args, 'nc4k_img', 'NOT FOUND')}, gt={getattr(args, 'nc4k_gt', 'NOT FOUND')}")
+    print()
+
     dataset_config = {
         'COD10K': (args.cod10k_img, args.cod10k_gt),
         'CHAMELEON': (args.chameleon_img, args.chameleon_gt),
