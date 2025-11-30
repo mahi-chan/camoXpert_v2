@@ -968,7 +968,7 @@ class Visualizer:
         return outputs
 
 
-def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparallel=True):
+def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparallel=False):
     """
     Load model from checkpoint, handling DDP 'module.' prefix.
 
@@ -1384,6 +1384,8 @@ def main():
     # Evaluation arguments
     parser.add_argument('--batch-size', type=int, default=1,
                        help='Batch size for evaluation (default: 1, use 8-16 for faster testing)')
+    parser.add_argument('--use-dataparallel', action='store_true',
+                       help='Enable DataParallel for multi-GPU inference (experimental, may cause errors)')
     parser.add_argument('--fast', action='store_true',
                        help='Fast mode: disable TTA, CRF, and visualizations for maximum speed')
     parser.add_argument('--tta', action='store_true',
@@ -1473,8 +1475,10 @@ def main():
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Datasets: {', '.join(args.datasets)}")
     print(f"Batch size: {args.batch_size}")
-    if torch.cuda.device_count() > 1:
+    if torch.cuda.device_count() > 1 and args.use_dataparallel:
         print(f"GPUs: {torch.cuda.device_count()} (DataParallel enabled)")
+    elif torch.cuda.device_count() > 1:
+        print(f"GPUs: {torch.cuda.device_count()} (single GPU mode, use --use-dataparallel for multi-GPU)")
     else:
         print(f"GPUs: {torch.cuda.device_count()}")
     print(f"TTA: {'Enabled' if args.tta else 'Disabled'}")
@@ -1504,7 +1508,8 @@ def main():
     print("="*70 + "\n")
 
     # Load model
-    model = load_checkpoint(args.checkpoint, num_experts=args.num_experts, device=device)
+    model = load_checkpoint(args.checkpoint, num_experts=args.num_experts, device=device,
+                           use_dataparallel=args.use_dataparallel)
 
     # Evaluate on each dataset
     all_results = {}
