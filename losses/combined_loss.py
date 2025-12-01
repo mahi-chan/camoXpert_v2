@@ -140,10 +140,13 @@ class BoundaryLoss(nn.Module):
             logits: [B, 1, H, W] - model output (NOT sigmoid)
             targets: [B, 1, H, W] - ground truth in [0, 1]
         """
+        # Cast kernel to same dtype as input (for AMP compatibility)
+        kernel = self.laplacian_kernel.to(dtype=targets.dtype)
+
         # Detect boundaries in GT using Laplacian
         boundaries = torch.abs(F.conv2d(
             targets,
-            self.laplacian_kernel,
+            kernel,
             padding=1
         ))
 
