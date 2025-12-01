@@ -130,7 +130,7 @@ class BoundaryLoss(nn.Module):
             [1, 1, 1],
             [1, -8, 1],
             [1, 1, 1]
-        ], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        ], dtype=torch.float16).unsqueeze(0).unsqueeze(0)
 
         self.register_buffer('laplacian_kernel', laplacian_kernel)
 
