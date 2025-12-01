@@ -146,10 +146,13 @@ class BoundaryLoss(nn.Module):
             targets_fp32 = targets.float()
             logits_fp32 = logits.float()
 
+            # Ensure kernel is on same device as input
+            kernel = self.laplacian_kernel.to(device=targets_fp32.device, dtype=targets_fp32.dtype)
+
             # Detect boundaries in GT using Laplacian
             boundaries = torch.abs(F.conv2d(
                 targets_fp32,
-                self.laplacian_kernel,
+                kernel,
                 padding=1
             ))
 
