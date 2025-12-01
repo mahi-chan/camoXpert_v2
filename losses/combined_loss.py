@@ -140,25 +140,28 @@ class BoundaryLoss(nn.Module):
             logits: [B, 1, H, W] - model output (NOT sigmoid)
             targets: [B, 1, H, W] - ground truth in [0, 1]
         """
-        # Cast kernel to same dtype as input (for AMP compatibility)
-        kernel = self.laplacian_kernel.to(dtype=targets.dtype)
+        # Force float32 for stable edge detection (bypass autocast)
+        with torch.cuda.amp.autocast(enabled=False):
+            # Cast inputs to float32 for edge detection
+            targets_fp32 = targets.float()
+            logits_fp32 = logits.float()
 
-        # Detect boundaries in GT using Laplacian
-        boundaries = torch.abs(F.conv2d(
-            targets,
-            kernel,
-            padding=1
-        ))
+            # Detect boundaries in GT using Laplacian
+            boundaries = torch.abs(F.conv2d(
+                targets_fp32,
+                self.laplacian_kernel,
+                padding=1
+            ))
 
-        # Normalize boundaries to [0, 1]
-        boundaries = torch.clamp(boundaries, 0, 1)
+            # Normalize boundaries to [0, 1]
+            boundaries = torch.clamp(boundaries, 0, 1)
 
-        # Create boundary weight map (1.0 + 2.0 * boundary_strength)
-        boundary_weights = 1.0 + 2.0 * boundaries
+            # Create boundary weight map (1.0 + 2.0 * boundary_strength)
+            boundary_weights = 1.0 + 2.0 * boundaries
 
-        # Weighted BCE with logits (autocast-safe)
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        weighted_bce = bce * boundary_weights
+            # Weighted BCE with logits (autocast-safe)
+            bce = F.binary_cross_entropy_with_logits(logits_fp32, targets_fp32, reduction='none')
+            weighted_bce = bce * boundary_weights
 
         return weighted_bce.mean()
 
