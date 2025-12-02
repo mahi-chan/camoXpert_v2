@@ -597,8 +597,8 @@ class SophisticatedRouter(nn.Module):
             expert_capacity_factor=expert_capacity_factor
         )
 
-        # Load balancing loss coefficient
-        self.load_balance_coef = 0.01
+        # Load balancing loss coefficient (increased 10x to prevent router collapse)
+        self.load_balance_coef = 0.1
 
     def forward(self, features, return_uncertainty=False):
         """
@@ -736,11 +736,35 @@ class SophisticatedRouter(nn.Module):
 
             return expert_probs, top_k_indices, top_k_weights, aux_outputs
 
+    def compute_entropy_bonus(self, probs):
+        """
+        Encourage routing entropy > 1.0 for diverse expert usage.
+
+        Higher entropy = more diverse routing = less expert collapse.
+
+        Args:
+            probs: [B, num_experts] - Probability distribution
+        Returns:
+            entropy_bonus: Scalar tensor (penalty when entropy < target)
+        """
+        # Compute entropy: -sum(p * log(p))
+        entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+
+        # Target entropy for diverse routing
+        # For 3 experts: log(3) ≈ 1.1, so target 1.0 means reasonably diverse
+        target_entropy = 1.0
+
+        # Penalize when entropy drops below target (encourages diversity)
+        entropy_bonus = F.relu(target_entropy - entropy)
+
+        return entropy_bonus
+
     def _compute_load_balance_loss(self, expert_probs):
         """
         Compute global-batch load balancing loss to prevent expert collapse.
 
         Encourages uniform expert usage across the batch.
+        NOW INCLUDES entropy regularization for diverse routing.
 
         Args:
             expert_probs: [B, num_experts]
@@ -759,7 +783,13 @@ class SophisticatedRouter(nn.Module):
         # Also penalize coefficient of variation (relative std)
         cv = mean_probs.std() / (mean_probs.mean() + 1e-8)
 
-        return self.load_balance_coef * (load_balance_loss + cv)
+        # Add entropy bonus to encourage diverse routing
+        entropy_loss = self.compute_entropy_bonus(expert_probs)
+
+        # Combined loss with entropy regularization (weight 0.05)
+        total_loss = self.load_balance_coef * (load_balance_loss + cv + 0.05 * entropy_loss)
+
+        return total_loss
 
     def get_expert_usage_stats(self, expert_probs):
         """

@@ -28,8 +28,7 @@ from models.expert_architectures import (
     SINetExpert,
     PraNetExpert,
     ZoomNetExpert,
-    UJSCExpert,
-    FEDERFrequencyExpert
+    UJSCExpert
 )
 
 
@@ -47,7 +46,7 @@ class ModelLevelMoE(nn.Module):
     4. Better generalization through specialization
     """
 
-    def __init__(self, backbone_name='pvt_v2_b2', num_experts=4, top_k=2,
+    def __init__(self, backbone_name='pvt_v2_b2', num_experts=3, top_k=2,
                  pretrained=True, use_deep_supervision=False):
         super().__init__()
 
@@ -85,21 +84,18 @@ class ModelLevelMoE(nn.Module):
         print(f"✓ Analyzes: texture, edges, context, frequency, multi-scale")
 
         # ============================================================
-        # EXPERT MODELS: 4 complete architectures
+        # EXPERT MODELS: 3 complete architectures
         # ============================================================
         print("\n[3/3] Creating expert models...")
 
-        # Available expert architectures (can be customized)
-        # Using FEDER (Frequency Expert with Dynamic Edge Reconstruction)
+        # Three complementary expert architectures
         self.expert_models = nn.ModuleList([
-            SINetExpert(self.feature_dims),           # Expert 0: Search & Identify
-            PraNetExpert(self.feature_dims),          # Expert 1: Reverse Attention
-            ZoomNetExpert(self.feature_dims),         # Expert 2: Multi-Scale Zoom
-            FEDERFrequencyExpert(self.feature_dims)   # Expert 3: Frequency-Domain
-            # UJSCExpert(self.feature_dims)           # Alternative: Uncertainty-Guided
+            SINetExpert(self.feature_dims),     # Expert 0: Search & Identify
+            PraNetExpert(self.feature_dims),    # Expert 1: Reverse Attention
+            ZoomNetExpert(self.feature_dims),   # Expert 2: Multi-Scale Zoom
         ])
 
-        expert_names = ["SINet-Style", "PraNet-Style", "ZoomNet-Style", "FEDER-Style"]
+        expert_names = ["SINet-Style", "PraNet-Style", "ZoomNet-Style"]
         for i, (name, expert) in enumerate(zip(expert_names, self.expert_models)):
             params = sum(p.numel() for p in expert.parameters())
             print(f"✓ Expert {i} ({name}): {params/1e6:.1f}M parameters")
@@ -147,6 +143,23 @@ class ModelLevelMoE(nn.Module):
         else:
             raise ValueError(f"Unknown backbone dimensions for: {backbone_name}")
 
+    def freeze_router(self):
+        """Freeze router parameters for expert-only training"""
+        for param in self.router.parameters():
+            param.requires_grad = False
+        print("✓ Router frozen (parameters will not be updated)")
+
+    def unfreeze_router(self):
+        """Unfreeze router parameters for router training"""
+        for param in self.router.parameters():
+            param.requires_grad = True
+        print("✓ Router unfrozen (parameters will be updated)")
+
+    def get_equal_routing_weights(self, batch_size, device):
+        """Return equal weights for all experts (used when router frozen)"""
+        weights = torch.ones(batch_size, self.num_experts, device=device) / self.num_experts
+        return weights
+
     def forward(self, x, return_routing_info=False):
         """
         Forward pass through Model-Level MoE
@@ -183,9 +196,13 @@ class ModelLevelMoE(nn.Module):
         if self.training or not self.top_k < self.num_experts:
             # During training or when using all experts: run all and combine
             expert_predictions = []
+            individual_expert_preds = []  # Store for per-expert supervision
+
             for expert in self.expert_models:
                 pred, _ = expert(features)  # [B, 1, H, W] (ignore aux outputs for ensemble)
                 expert_predictions.append(pred)
+                if self.training:
+                    individual_expert_preds.append(pred)
 
             expert_predictions = torch.stack(expert_predictions, dim=1)  # [B, num_experts, 1, H, W]
 
@@ -226,6 +243,10 @@ class ModelLevelMoE(nn.Module):
                 'load_balance_loss': router_aux.get('load_balance_loss', None),
                 'confidence': router_aux.get('confidence', None)
             }
+            # Add individual expert predictions for per-expert supervision during training
+            if self.training and 'individual_expert_preds' in locals():
+                routing_info['individual_expert_preds'] = individual_expert_preds
+
             return final_prediction, routing_info
         else:
             return final_prediction
