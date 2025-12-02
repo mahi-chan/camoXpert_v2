@@ -46,7 +46,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from models.model_level_moe import ModelLevelMoE
 from data.dataset import COD10KDataset
-from losses import CombinedLoss
+from losses.boundary_aware_loss import CombinedEnhancedLoss
 from utils.ema import EMA
 from metrics.cod_metrics import CODMetrics
 
@@ -280,17 +280,11 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
 
 def train_epoch(model, dataloader, criterion, optimizer, scaler, device, ema, mixup,
                 use_mixup=True, accumulation_steps=1, rank=0):
-    """Train for one epoch"""
+    """Train for one epoch with enhanced boundary-aware loss"""
     model.train()
 
     total_loss = 0.0
-    loss_components = {
-        'focal': 0.0,
-        'tversky': 0.0,
-        'boundary': 0.0,
-        'ssim': 0.0,
-        'dice': 0.0
-    }
+    loss_components = {}
     num_batches = 0
 
     pbar = tqdm(dataloader, desc="Training", disable=(rank != 0))
@@ -307,11 +301,15 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, ema, mi
 
         # Forward pass with mixed precision
         with autocast():
-            output = model(images)
-            logits = output['pred'] if isinstance(output, dict) else (output[0] if isinstance(output, tuple) else output)
+            # Get prediction AND auxiliary outputs (routing_info)
+            pred, routing_info = model(images, return_routing_info=True)
 
-            # Compute loss
-            loss, loss_dict = criterion(logits, masks)
+            # Apply sigmoid if needed
+            if pred.min() < 0:
+                pred = torch.sigmoid(pred)
+
+            # Compute enhanced loss with auxiliary outputs
+            loss, loss_dict = criterion(pred, masks, aux_outputs=routing_info)
             loss = loss / accumulation_steps  # Scale loss for gradient accumulation
 
         # Backward pass
@@ -334,15 +332,22 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, ema, mi
 
         # Accumulate losses
         total_loss += loss.item() * accumulation_steps
-        for key in loss_components:
-            loss_components[key] += loss_dict[key]
+        for key, value in loss_dict.items():
+            if key not in loss_components:
+                loss_components[key] = 0.0
+            if isinstance(value, torch.Tensor):
+                loss_components[key] += value.item()
+            else:
+                loss_components[key] += value
         num_batches += 1
 
         # Update progress bar
         if rank == 0:
+            seg_loss = loss_dict.get('seg_bce', 0)
+            seg_loss_val = seg_loss.item() if isinstance(seg_loss, torch.Tensor) else seg_loss
             pbar.set_postfix({
                 'loss': f"{loss.item() * accumulation_steps:.4f}",
-                'tversky': f"{loss_dict['tversky']:.4f}"
+                'seg': f"{seg_loss_val:.3f}"
             })
 
     # Compute averages
@@ -371,8 +376,8 @@ def main():
     # ========== Model Arguments ==========
     parser.add_argument('--backbone', type=str, default='pvt_v2_b2',
                        help='Backbone architecture (default: pvt_v2_b2)')
-    parser.add_argument('--num-experts', type=int, default=4,
-                       help='Number of experts (default: 4)')
+    parser.add_argument('--num-experts', type=int, default=3,
+                       help='Number of experts (default: 3 - SINet, PraNet, ZoomNet)')
     parser.add_argument('--top-k', type=int, default=2,
                        help='Number of experts to select (default: 2)')
     parser.add_argument('--pretrained', action='store_true', default=True,
@@ -394,23 +399,19 @@ def main():
     parser.add_argument('--accumulation-steps', type=int, default=1,
                        help='Gradient accumulation steps (default: 1)')
 
-    # ========== Loss Arguments ==========
-    parser.add_argument('--focal-weight', type=float, default=1.0,
-                       help='Weight for focal loss (default: 1.0)')
-    parser.add_argument('--tversky-weight', type=float, default=2.0,
-                       help='Weight for tversky loss - HIGH fixes under-segmentation (default: 2.0)')
-    parser.add_argument('--boundary-weight', type=float, default=1.0,
-                       help='Weight for boundary loss (default: 1.0)')
-    parser.add_argument('--ssim-weight', type=float, default=0.5,
-                       help='Weight for SSIM loss (default: 0.5)')
-    parser.add_argument('--dice-weight', type=float, default=1.0,
-                       help='Weight for dice loss (default: 1.0)')
-    parser.add_argument('--pos-weight', type=float, default=3.0,
-                       help='Positive pixel weight in focal loss (default: 3.0)')
-    parser.add_argument('--tversky-alpha', type=float, default=0.3,
-                       help='Tversky alpha (FP weight) (default: 0.3)')
-    parser.add_argument('--tversky-beta', type=float, default=0.7,
-                       help='Tversky beta (FN weight) - HIGH penalizes under-segmentation (default: 0.7)')
+    # ========== Loss Arguments (Enhanced Boundary-Aware Loss) ==========
+    parser.add_argument('--seg-weight', type=float, default=1.0,
+                       help='Weight for segmentation loss (boundary-aware BCE + Dice) (default: 1.0)')
+    parser.add_argument('--boundary-weight', type=float, default=2.0,
+                       help='Weight for boundary prediction loss (default: 2.0)')
+    parser.add_argument('--discontinuity-weight', type=float, default=0.3,
+                       help='Weight for discontinuity supervision (TDD + GAD) (default: 0.3)')
+    parser.add_argument('--expert-weight', type=float, default=0.3,
+                       help='Weight for per-expert supervision (default: 0.3)')
+    parser.add_argument('--hard-mining-weight', type=float, default=0.5,
+                       help='Weight for hard sample mining (default: 0.5)')
+    parser.add_argument('--load-balance-weight', type=float, default=0.1,
+                       help='Weight for router load balance (default: 0.1)')
 
     # ========== EMA Arguments ==========
     parser.add_argument('--ema-decay', type=float, default=0.999,
@@ -491,12 +492,13 @@ def main():
         print(f"Mixup: {args.use_mixup} (alpha={args.mixup_alpha})")
         print(f"Progressive Aug: {args.enable_progressive_aug}")
         print(f"Router Warmup: {args.enable_router_warmup} (epochs={args.router_warmup_epochs})")
-        print(f"\nLoss Weights:")
-        print(f"  Focal:    {args.focal_weight} (pos_weight={args.pos_weight})")
-        print(f"  Tversky:  {args.tversky_weight} ⭐ (α={args.tversky_alpha}, β={args.tversky_beta})")
-        print(f"  Boundary: {args.boundary_weight}")
-        print(f"  SSIM:     {args.ssim_weight}")
-        print(f"  Dice:     {args.dice_weight}")
+        print(f"\nEnhanced Loss Weights (Boundary-Aware):")
+        print(f"  Segmentation:     {args.seg_weight}")
+        print(f"  Boundary Pred:    {args.boundary_weight} ⭐")
+        print(f"  Discontinuity:    {args.discontinuity_weight}")
+        print(f"  Per-Expert:       {args.expert_weight}")
+        print(f"  Hard Mining:      {args.hard_mining_weight}")
+        print(f"  Load Balance:     {args.load_balance_weight}")
         print(f"{'='*70}\n")
 
     # Create checkpoint directory
@@ -576,14 +578,14 @@ def main():
         if rank == 0:
             print(f"✓ EMA created with decay={args.ema_decay}\n")
 
-    # Create loss function
-    criterion = CombinedLoss(
-        focal_weight=args.focal_weight,
-        tversky_weight=args.tversky_weight,
+    # Create enhanced loss function with boundary awareness
+    criterion = CombinedEnhancedLoss(
+        seg_weight=args.seg_weight,
         boundary_weight=args.boundary_weight,
-        ssim_weight=args.ssim_weight,
-        dice_weight=args.dice_weight,
-        pos_weight=args.pos_weight
+        discontinuity_weight=args.discontinuity_weight,
+        expert_weight=args.expert_weight,
+        hard_mining_weight=args.hard_mining_weight,
+        load_balance_weight=args.load_balance_weight
     )
 
     # Create optimizer
@@ -665,19 +667,17 @@ def main():
                 print(f"Aug strength: {progressive_aug.current_strength:.2f}")
 
         # Router warmup: freeze router for first N epochs
-        if args.enable_router_warmup and epoch < args.router_warmup_epochs:
-            model_to_freeze = model.module if args.use_ddp else model
-            if hasattr(model_to_freeze, 'router'):
-                for param in model_to_freeze.router.parameters():
-                    param.requires_grad = False
-        elif args.enable_router_warmup and epoch == args.router_warmup_epochs:
-            # Unfreeze router
-            model_to_freeze = model.module if args.use_ddp else model
-            if hasattr(model_to_freeze, 'router'):
-                for param in model_to_freeze.router.parameters():
-                    param.requires_grad = True
-                if rank == 0:
-                    print("✓ Router unfrozen\n")
+        if args.enable_router_warmup:
+            model_to_control = model.module if args.use_ddp else model
+            if hasattr(model_to_control, 'freeze_router'):
+                if epoch < args.router_warmup_epochs:
+                    model_to_control.freeze_router()
+                    if epoch == 0 and rank == 0:
+                        print(f"🔒 Router FROZEN for first {args.router_warmup_epochs} epochs\n")
+                elif epoch == args.router_warmup_epochs:
+                    model_to_control.unfreeze_router()
+                    if rank == 0:
+                        print("🔓 Router UNFROZEN - now learning to route\n")
 
         if rank == 0:
             print(f"\n{'='*70}")
@@ -693,8 +693,15 @@ def main():
         if rank == 0:
             print(f"\nTraining Loss: {avg_loss:.4f}")
             print("Loss Components:")
+            # Print main components first
+            main_keys = ['seg_bce', 'seg_dice', 'boundary', 'tdd', 'gad', 'expert', 'hard_mining', 'load_balance']
+            for key in main_keys:
+                if key in loss_components:
+                    print(f"  {key}: {loss_components[key]:.4f}")
+            # Print any other components
             for key, value in loss_components.items():
-                print(f"  {key}: {value:.4f}")
+                if key not in main_keys and key != 'total':
+                    print(f"  {key}: {value:.4f}")
 
             history['train_loss'].append(avg_loss)
             history['train_loss_components'].append(loss_components)
@@ -731,18 +738,24 @@ def main():
                 ema.restore()
 
             if rank == 0:
-                print(f"\nValidation Results (best threshold={best_metrics['best_threshold']}):")
-                print(f"  S-measure: {best_metrics['S-measure']:.4f} ⭐")
+                print(f"\nValidation Results:")
+                print(f"  IoU @ 0.3: {threshold_results[0.3]['IoU']:.4f}")
+                print(f"  IoU @ 0.4: {threshold_results[0.4]['IoU']:.4f}")
+                print(f"  IoU @ 0.5: {threshold_results[0.5]['IoU']:.4f}")
+                print(f"  Best IoU:  {best_metrics['IoU']:.4f} ⭐ (threshold={best_metrics['best_threshold']})")
+                print(f"  S-measure: {best_metrics['S-measure']:.4f}")
                 print(f"  F-measure: {best_metrics['F-measure']:.4f}")
-                print(f"  IoU:       {best_metrics['IoU']:.4f}")
                 print(f"  MAE:       {best_metrics['MAE']:.4f}")
 
                 print(f"\nDiagnostics:")
-                print(f"  Mean prediction confidence: {diagnostics['mean_pred_confidence']:.4f}")
-                print(f"  % images with IoU > 0.7:    {diagnostics['pct_iou_above_0.7']:.1f}%")
+                print(f"  Mean prediction: {diagnostics['mean_pred_confidence']:.4f}")
+                print(f"  % IoU > 0.7:     {diagnostics['pct_iou_above_0.7']:.1f}%")
 
-                if diagnostics['warning']:
-                    print(f"  ⚠️  WARNING: Mean prediction < 0.2 (under-confident model)")
+                # Warnings
+                if diagnostics['mean_pred_confidence'] < 0.2:
+                    print(f"  ⚠️  WARNING: Model is under-confident (mean < 0.2)!")
+                elif diagnostics['mean_pred_confidence'] > 0.6:
+                    print(f"  ⚠️  WARNING: Model is over-confident (mean > 0.6)!")
 
                 history['val_metrics'].append(best_metrics)
                 history['val_diagnostics'].append(diagnostics)
