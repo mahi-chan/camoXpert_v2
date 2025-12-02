@@ -22,7 +22,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch.cuda.amp import autocast, GradScaler
@@ -108,8 +111,14 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating", leave=False):
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
+            # Handle both tuple and dict formats
+            if isinstance(batch, dict):
+                images = batch['image'].to(device)
+                masks = batch['mask'].to(device)
+            else:
+                images, masks = batch
+                images = images.to(device)
+                masks = masks.to(device)
 
             # Forward
             pred, _ = model(images)
@@ -153,6 +162,20 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
     return best_metrics, threshold_results, diagnostics
 
 
+def setup_ddp(args):
+    """Setup distributed training."""
+    if args.use_ddp:
+        dist.init_process_group(backend='nccl')
+        args.local_rank = dist.get_rank()
+        torch.cuda.set_device(args.local_rank)
+        args.world_size = dist.get_world_size()
+    else:
+        args.world_size = 1
+        args.local_rank = 0
+
+    return args.local_rank == 0  # is_main_process
+
+
 def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
     """Train for one epoch"""
     model.train()
@@ -168,8 +191,14 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
     pbar = tqdm(dataloader, desc="Training")
 
     for batch in pbar:
-        images = batch['image'].to(device)
-        masks = batch['mask'].to(device)
+        # Handle both tuple and dict formats
+        if isinstance(batch, dict):
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+        else:
+            images, masks = batch
+            images = images.to(device)
+            masks = masks.to(device)
 
         # Forward with AMP
         with autocast():
@@ -262,7 +291,16 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
 
+    # DDP
+    parser.add_argument('--use-ddp', action='store_true',
+                       help='Use Distributed Data Parallel training')
+    parser.add_argument('--local_rank', type=int, default=0,
+                       help='Local rank for DDP (set by torchrun)')
+
     args = parser.parse_args()
+
+    # Setup DDP
+    is_main_process = setup_ddp(args)
 
     # Set seed
     torch.manual_seed(args.seed)
@@ -270,28 +308,35 @@ def main():
     np.random.seed(args.seed)
 
     # Device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if args.use_ddp:
+        device = torch.device(f'cuda:{args.local_rank}')
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
-    print(f"\n{'='*70}")
-    print("SINGLE SINET EXPERT TRAINING - DIAGNOSTIC")
-    print(f"{'='*70}")
-    print(f"Device: {device}")
-    print(f"Image size: {args.image_size}")
-    print(f"Batch size: {args.batch_size}")
-    print(f"Epochs: {args.epochs}")
-    print(f"Learning rate: {args.lr}")
-    print(f"\nLoss weights:")
-    print(f"  Tversky: {args.tversky_weight} ⭐")
-    print(f"  BCE:     {args.bce_weight} (pos_weight={args.pos_weight})")
-    print(f"  SSIM:    {args.ssim_weight}")
-    print(f"{'='*70}\n")
+    if is_main_process:
+        print(f"\n{'='*70}")
+        print("SINGLE SINET EXPERT TRAINING - DIAGNOSTIC")
+        print(f"{'='*70}")
+        print(f"Device: {device}")
+        print(f"DDP: {args.use_ddp} (world_size={args.world_size})")
+        print(f"Image size: {args.image_size}")
+        print(f"Batch size: {args.batch_size}")
+        print(f"Epochs: {args.epochs}")
+        print(f"Learning rate: {args.lr}")
+        print(f"\nLoss weights:")
+        print(f"  Tversky: {args.tversky_weight} ⭐")
+        print(f"  BCE:     {args.bce_weight} (pos_weight={args.pos_weight})")
+        print(f"  SSIM:    {args.ssim_weight}")
+        print(f"{'='*70}\n")
 
     # Create checkpoint dir
     checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if is_main_process:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # Create datasets
-    print("Loading datasets...")
+    if is_main_process:
+        print("Loading datasets...")
 
     train_dataset = COD10KDataset(
         root_dir=args.data_root,
@@ -309,10 +354,29 @@ def main():
         cache_in_memory=True
     )
 
+    # Samplers for DDP
+    if args.use_ddp:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.local_rank,
+            shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=args.world_size,
+            rank=args.local_rank,
+            shuffle=False
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
@@ -321,27 +385,53 @@ def main():
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=args.num_workers,
         pin_memory=True
     )
 
-    print(f"✓ Train samples: {len(train_dataset)}")
-    print(f"✓ Val samples: {len(val_dataset)}\n")
+    if is_main_process:
+        print(f"✓ Train samples: {len(train_dataset)}")
+        print(f"✓ Val samples: {len(val_dataset)}\n")
 
     # Create model
-    print("Creating model...")
+    if is_main_process:
+        print("Creating model...")
     model = SimpleSINet(
         backbone_name=args.backbone,
         pretrained=args.pretrained
     ).to(device)
 
+    # Wrap with DDP
+    if args.use_ddp:
+        model = DDP(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            find_unused_parameters=False
+        )
+
     # Create loss
-    criterion = CombinedSingleExpertLoss(
-        tversky_weight=args.tversky_weight,
-        bce_weight=args.bce_weight,
-        ssim_weight=args.ssim_weight,
-        pos_weight=args.pos_weight
-    )
+    if is_main_process:
+        criterion = CombinedSingleExpertLoss(
+            tversky_weight=args.tversky_weight,
+            bce_weight=args.bce_weight,
+            ssim_weight=args.ssim_weight,
+            pos_weight=args.pos_weight
+        )
+    else:
+        # Create loss without printing (for non-main processes)
+        import io
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = io.StringIO()
+        criterion = CombinedSingleExpertLoss(
+            tversky_weight=args.tversky_weight,
+            bce_weight=args.bce_weight,
+            ssim_weight=args.ssim_weight,
+            pos_weight=args.pos_weight
+        )
+        sys.stdout = old_stdout
 
     # Create optimizer
     optimizer = AdamW(
@@ -376,23 +466,30 @@ def main():
 
     best_iou = 0.0
 
-    print("Starting training...\n")
+    if is_main_process:
+        print("Starting training...\n")
 
     # Training loop
     for epoch in range(args.epochs):
-        print(f"\n{'='*70}")
-        print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"{'='*70}")
+        # Set epoch for distributed sampler
+        if args.use_ddp:
+            train_sampler.set_epoch(epoch)
+
+        if is_main_process:
+            print(f"\n{'='*70}")
+            print(f"Epoch {epoch+1}/{args.epochs}")
+            print(f"{'='*70}")
 
         # Train
         avg_loss, loss_components = train_epoch(
             model, train_loader, criterion, optimizer, scaler, device
         )
 
-        print(f"\nTraining Loss: {avg_loss:.4f}")
-        print("Loss Components:")
-        for key, value in loss_components.items():
-            print(f"  {key}: {value:.4f}")
+        if is_main_process:
+            print(f"\nTraining Loss: {avg_loss:.4f}")
+            print("Loss Components:")
+            for key, value in loss_components.items():
+                print(f"  {key}: {value:.4f}")
 
         history['train_loss'].append(avg_loss)
 
@@ -402,50 +499,53 @@ def main():
         else:
             main_scheduler.step()
 
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"\nLearning rate: {current_lr:.2e}")
+        if is_main_process:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"\nLearning rate: {current_lr:.2e}")
 
         # Validate
         if (epoch + 1) % args.val_freq == 0:
-            print("\nValidating...")
+            if is_main_process:
+                print("\nValidating...")
 
             best_metrics, threshold_results, diagnostics = validate_multi_threshold(
                 model, val_loader, device, thresholds=[0.3, 0.4, 0.5]
             )
 
-            print(f"\nValidation Results (best threshold={best_metrics['best_threshold']}):")
-            print(f"  S-measure: {best_metrics['S-measure']:.4f}")
-            print(f"  F-measure: {best_metrics['F-measure']:.4f}")
-            print(f"  IoU:       {best_metrics['IoU']:.4f} {'⭐' if best_metrics['IoU'] > 0.65 else ''}")
-            print(f"  MAE:       {best_metrics['MAE']:.4f}")
+            if is_main_process:
+                print(f"\nValidation Results (best threshold={best_metrics['best_threshold']}):")
+                print(f"  S-measure: {best_metrics['S-measure']:.4f}")
+                print(f"  F-measure: {best_metrics['F-measure']:.4f}")
+                print(f"  IoU:       {best_metrics['IoU']:.4f} {'⭐' if best_metrics['IoU'] > 0.65 else ''}")
+                print(f"  MAE:       {best_metrics['MAE']:.4f}")
 
-            print(f"\nPrediction Statistics:")
-            print(f"  Mean: {diagnostics['mean_pred']:.4f}")
-            print(f"  Min:  {diagnostics['min_pred']:.4f}")
-            print(f"  Max:  {diagnostics['max_pred']:.4f}")
+                print(f"\nPrediction Statistics:")
+                print(f"  Mean: {diagnostics['mean_pred']:.4f}")
+                print(f"  Min:  {diagnostics['min_pred']:.4f}")
+                print(f"  Max:  {diagnostics['max_pred']:.4f}")
 
-            if diagnostics['warning']:
-                print(f"  ⚠️  WARNING: Mean prediction < 0.2 (under-confident model)")
+                if diagnostics['warning']:
+                    print(f"  ⚠️  WARNING: Mean prediction < 0.2 (under-confident model)")
 
-            history['val_metrics'].append(best_metrics)
-            history['diagnostics'].append(diagnostics)
+                history['val_metrics'].append(best_metrics)
+                history['diagnostics'].append(diagnostics)
 
-            # Save best model
-            if best_metrics['IoU'] > best_iou:
-                best_iou = best_metrics['IoU']
-                print(f"\n✓ New best IoU: {best_iou:.4f}")
+                # Save best model
+                if best_metrics['IoU'] > best_iou:
+                    best_iou = best_metrics['IoU']
+                    print(f"\n✓ New best IoU: {best_iou:.4f}")
 
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_iou': best_iou,
-                    'metrics': best_metrics,
-                    'args': vars(args)
-                }, checkpoint_dir / 'best_model.pth')
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'best_iou': best_iou,
+                        'metrics': best_metrics,
+                        'args': vars(args)
+                    }, checkpoint_dir / 'best_model.pth')
 
         # Save checkpoint
-        if (epoch + 1) % args.save_freq == 0:
+        if (epoch + 1) % args.save_freq == 0 and is_main_process:
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -455,34 +555,39 @@ def main():
             }, checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pth')
 
     # Save final model
-    print("\nSaving final model...")
-    torch.save({
-        'epoch': args.epochs - 1,
-        'model_state_dict': model.state_dict(),
-        'best_iou': best_iou,
-        'args': vars(args)
-    }, checkpoint_dir / 'final_model.pth')
+    if is_main_process:
+        print("\nSaving final model...")
+        torch.save({
+            'epoch': args.epochs - 1,
+            'model_state_dict': model.state_dict(),
+            'best_iou': best_iou,
+            'args': vars(args)
+        }, checkpoint_dir / 'final_model.pth')
 
-    # Save history
-    with open(checkpoint_dir / 'history.json', 'w') as f:
-        json.dump(history, f, indent=2)
+        # Save history
+        with open(checkpoint_dir / 'history.json', 'w') as f:
+            json.dump(history, f, indent=2)
 
-    print(f"\n{'='*70}")
-    print("TRAINING COMPLETE")
-    print(f"{'='*70}")
-    print(f"Best IoU: {best_iou:.4f}")
-    print(f"Target:   0.6500 {'✓' if best_iou >= 0.65 else '✗'}")
-    print(f"\nCheckpoints saved to: {checkpoint_dir}")
-    print(f"{'='*70}\n")
+        print(f"\n{'='*70}")
+        print("TRAINING COMPLETE")
+        print(f"{'='*70}")
+        print(f"Best IoU: {best_iou:.4f}")
+        print(f"Target:   0.6500 {'✓' if best_iou >= 0.65 else '✗'}")
+        print(f"\nCheckpoints saved to: {checkpoint_dir}")
+        print(f"{'='*70}\n")
 
-    if best_iou >= 0.65:
-        print("✅ SUCCESS! Loss function works correctly.")
-        print("   You can now use it in full MoE training.\n")
-    else:
-        print("⚠️  IoU below target. Consider:")
-        print("   - Increasing tversky_weight to 3.0")
-        print("   - Increasing pos_weight to 5.0")
-        print("   - Training for more epochs\n")
+        if best_iou >= 0.65:
+            print("✅ SUCCESS! Loss function works correctly.")
+            print("   You can now use it in full MoE training.\n")
+        else:
+            print("⚠️  IoU below target. Consider:")
+            print("   - Increasing tversky_weight to 3.0")
+            print("   - Increasing pos_weight to 5.0")
+            print("   - Training for more epochs\n")
+
+    # Cleanup DDP
+    if args.use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
