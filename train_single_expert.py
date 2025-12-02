@@ -150,7 +150,10 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
         metrics = CODMetrics()
 
         for i in range(all_preds.size(0)):
-            metrics.update(all_preds[i], all_gts[i], threshold=thresh)
+            # Add batch dimension back (metrics expect [B, C, H, W])
+            pred_sample = all_preds[i].unsqueeze(0)  # [1, H, W] -> [1, 1, H, W]
+            gt_sample = all_gts[i].unsqueeze(0)      # [1, H, W] -> [1, 1, H, W]
+            metrics.update(pred_sample, gt_sample, threshold=thresh)
 
         threshold_results[thresh] = metrics.compute()
 
