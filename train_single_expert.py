@@ -294,17 +294,19 @@ def main():
     print("Loading datasets...")
 
     train_dataset = COD10KDataset(
-        root=args.data_root,
+        root_dir=args.data_root,
         split='train',
-        image_size=args.image_size,
-        augmentation=True
+        img_size=args.image_size,
+        augment=True,
+        cache_in_memory=True
     )
 
     val_dataset = COD10KDataset(
-        root=args.data_root,
+        root_dir=args.data_root,
         split='val',
-        image_size=args.image_size,
-        augmentation=False
+        img_size=args.image_size,
+        augment=False,
+        cache_in_memory=True
     )
 
     train_loader = DataLoader(
