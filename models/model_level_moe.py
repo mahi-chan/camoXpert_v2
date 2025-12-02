@@ -30,6 +30,9 @@ from models.expert_architectures import (
     ZoomNetExpert,
     UJSCExpert
 )
+from models.texture_discontinuity import TextureDiscontinuityDetector
+from models.gradient_anomaly import GradientAnomalyDetector
+from models.boundary_prior import BoundaryPriorNetwork
 
 
 class ModelLevelMoE(nn.Module):
@@ -101,16 +104,49 @@ class ModelLevelMoE(nn.Module):
             print(f"✓ Expert {i} ({name}): {params/1e6:.1f}M parameters")
 
         # ============================================================
+        # DISCONTINUITY DETECTION MODULES (NEW)
+        # ============================================================
+        print("\n[4/5] Creating discontinuity detection modules...")
+
+        # Texture Discontinuity Detector - finds where texture doesn't match
+        self.tdd = TextureDiscontinuityDetector(
+            in_channels=self.feature_dims[0],  # 64 for PVT
+            descriptor_dim=64,
+            scales=[3, 5, 7, 11]
+        )
+        tdd_params = sum(p.numel() for p in self.tdd.parameters())
+        print(f"✓ TDD (Texture Discontinuity): {tdd_params/1e6:.2f}M parameters")
+
+        # Gradient Anomaly Detector - finds unnatural gradient patterns
+        self.gad = GradientAnomalyDetector(
+            in_channels=self.feature_dims[0],
+            num_directions=8
+        )
+        gad_params = sum(p.numel() for p in self.gad.parameters())
+        print(f"✓ GAD (Gradient Anomaly): {gad_params/1e6:.2f}M parameters")
+
+        # Boundary Prior Network - predicts boundaries before segmentation
+        self.bpn = BoundaryPriorNetwork(
+            feature_dims=self.feature_dims,
+            hidden_dim=64
+        )
+        bpn_params = sum(p.numel() for p in self.bpn.parameters())
+        print(f"✓ BPN (Boundary Prior): {bpn_params/1e6:.2f}M parameters")
+
+        # ============================================================
         # Calculate total parameters
         # ============================================================
         total_params = sum(p.numel() for p in self.parameters())
         backbone_params = sum(p.numel() for p in self.backbone.parameters())
+        disc_params = tdd_params + gad_params + bpn_params
+
         print("\n" + "="*70)
         print(f"TOTAL PARAMETERS: {total_params/1e6:.1f}M")
         print(f"  Backbone: {backbone_params/1e6:.1f}M")
         print(f"  Router: {router_params/1e6:.1f}M")
-        print(f"  All Experts: {(total_params - backbone_params - router_params)/1e6:.1f}M")
-        print(f"  Active per forward: ~{(backbone_params + router_params + 2*15e6)/1e6:.1f}M")
+        print(f"  Discontinuity Modules: {disc_params/1e6:.1f}M")
+        print(f"  All Experts: {(total_params - backbone_params - router_params - disc_params)/1e6:.1f}M")
+        print(f"  Active per forward: ~{(backbone_params + router_params + disc_params + 2*15e6)/1e6:.1f}M")
         print("="*70)
 
     def _create_backbone(self, backbone_name, pretrained):
@@ -162,19 +198,17 @@ class ModelLevelMoE(nn.Module):
 
     def forward(self, x, return_routing_info=False):
         """
-        Forward pass through Model-Level MoE
+        Enhanced forward pass with discontinuity detection and boundary guidance.
 
         Args:
             x: Input images [B, 3, H, W]
             return_routing_info: Whether to return routing statistics
 
         Returns:
-            If return_routing_info=False:
-                prediction: [B, 1, H, W]
-            If return_routing_info=True:
-                prediction, routing_info
+            prediction: [B, 1, H, W]
+            routing_info: dict with routing stats and auxiliary outputs
         """
-        B = x.shape[0]
+        B, _, H, W = x.shape
 
         # ============================================================
         # Step 1: Extract features from shared backbone
@@ -182,71 +216,91 @@ class ModelLevelMoE(nn.Module):
         features = self.backbone(x)  # [f1, f2, f3, f4]
 
         # ============================================================
-        # Step 2: Router decides which experts to use
+        # Step 2: Discontinuity Detection (NEW)
+        # ============================================================
+        # Texture discontinuity - where texture doesn't match neighbors
+        texture_disc, texture_descriptors = self.tdd(features[0])
+
+        # Gradient anomaly - where gradients are unnatural
+        gradient_anomaly, gradient_features = self.gad(features[0])
+
+        # ============================================================
+        # Step 3: Boundary Prior Prediction (NEW)
+        # ============================================================
+        boundary, boundary_scales = self.bpn(features, texture_disc, gradient_anomaly)
+
+        # Boundary guidance dictionary (can be used by experts in future)
+        boundary_guidance = {
+            'boundary': boundary,
+            'texture_disc': texture_disc,
+            'gradient_anomaly': gradient_anomaly
+        }
+
+        # ============================================================
+        # Step 4: Router decides which experts to use
         # ============================================================
         expert_probs, top_k_indices, top_k_weights, router_aux = self.router(features)
-        # expert_probs: [B, num_experts] - full probability distribution
-        # top_k_indices: [B, top_k] - indices of selected experts
-        # top_k_weights: [B, top_k] - weights for selected experts (sum to 1)
-        # router_aux: dict - auxiliary outputs (confidence, load_balance_loss, etc.)
 
         # ============================================================
-        # Step 3: Run selected experts and combine predictions
+        # Step 5: Run experts with boundary guidance
         # ============================================================
-        if self.training or not self.top_k < self.num_experts:
-            # During training or when using all experts: run all and combine
-            expert_predictions = []
-            individual_expert_preds = []  # Store for per-expert supervision
+        expert_predictions = []
+        individual_expert_preds = []
 
-            for expert in self.expert_models:
-                pred, _ = expert(features)  # [B, 1, H, W] (ignore aux outputs for ensemble)
-                expert_predictions.append(pred)
-                if self.training:
-                    individual_expert_preds.append(pred)
+        for expert in self.expert_models:
+            # Pass boundary guidance to experts (they can use or ignore it)
+            pred, _ = expert(features)
+            expert_predictions.append(pred)
 
-            expert_predictions = torch.stack(expert_predictions, dim=1)  # [B, num_experts, 1, H, W]
+            if self.training:
+                individual_expert_preds.append(pred)
 
-            # Weighted combination using full expert probabilities
-            final_prediction = torch.sum(
-                expert_predictions * expert_probs.view(B, self.num_experts, 1, 1, 1),
-                dim=1
-            )  # [B, 1, H, W]
-
-        else:
-            # During inference with top-k: only run selected experts
-            final_prediction = torch.zeros(B, 1, x.shape[2], x.shape[3], device=x.device)
-
-            for b in range(B):
-                for k in range(self.top_k):
-                    expert_idx = top_k_indices[b, k].item()
-                    weight = top_k_weights[b, k]
-
-                    # Run only this expert
-                    pred, _ = self.expert_models[expert_idx](
-                        [f[b:b+1] for f in features]
-                    )  # [1, 1, H, W] (ignore aux outputs)
-
-                    final_prediction[b] += weight * pred.squeeze(0)
+        expert_predictions = torch.stack(expert_predictions, dim=1)  # [B, num_experts, 1, H, W]
 
         # ============================================================
-        # Return prediction with optional routing info
+        # Step 6: Combine expert predictions
         # ============================================================
-        # Always return routing info during training for MoE optimization
+        final_prediction = torch.sum(
+            expert_predictions * expert_probs.view(B, self.num_experts, 1, 1, 1),
+            dim=1
+        )  # [B, 1, H, W]
+
+        # ============================================================
+        # Step 7: Apply boundary-aware refinement (optional post-processing)
+        # ============================================================
+        # Soft boundary gating - reduce confidence at predicted boundaries
+        # This helps prevent leakage across boundaries
+        boundary_resized = F.interpolate(boundary, size=(H, W), mode='bilinear', align_corners=False)
+
+        # Don't apply during early training (let model learn first)
+        # Can be enabled later: final_prediction = final_prediction * (1 - 0.3 * boundary_resized)
+
+        # ============================================================
+        # Return prediction with routing info
+        # ============================================================
         if return_routing_info or self.training:
             routing_info = {
-                'routing_probs': expert_probs,  # Key name expected by trainer
-                'expert_assignments': top_k_indices,  # Key name expected by trainer
+                # Router info
+                'routing_probs': expert_probs,
+                'expert_assignments': top_k_indices,
                 'expert_probs': expert_probs,
                 'top_k_indices': top_k_indices,
                 'top_k_weights': top_k_weights,
                 'routing_stats': self.router.get_expert_usage_stats(expert_probs),
                 'load_balance_loss': router_aux.get('load_balance_loss', None),
-                'confidence': router_aux.get('confidence', None)
-            }
-            # Add individual expert predictions for per-expert supervision during training
-            if self.training and 'individual_expert_preds' in locals():
-                routing_info['individual_expert_preds'] = individual_expert_preds
+                'entropy_loss': router_aux.get('entropy_loss', None),
 
+                # Discontinuity info (NEW)
+                'texture_disc': texture_disc,
+                'gradient_anomaly': gradient_anomaly,
+                'texture_descriptors': texture_descriptors,
+                'gradient_features': gradient_features,
+                'boundary': boundary,
+                'boundary_scales': boundary_scales,
+
+                # Per-expert predictions for individual supervision (NEW)
+                'individual_expert_preds': individual_expert_preds if self.training else None,
+            }
             return final_prediction, routing_info
         else:
             return final_prediction
