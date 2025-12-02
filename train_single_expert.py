@@ -96,7 +96,7 @@ class SimpleSINet(nn.Module):
         return pred, aux_preds
 
 
-def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.5]):
+def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.5], is_main_process=True):
     """
     Validate at multiple thresholds and return best results.
 
@@ -109,8 +109,14 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
     all_preds = []
     all_gts = []
 
+    # Only show progress bar on main process
+    if is_main_process:
+        iterator = tqdm(dataloader, desc="Validating", leave=False)
+    else:
+        iterator = dataloader
+
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Validating", leave=False):
+        for batch in iterator:
             # Handle both tuple and dict formats
             if isinstance(batch, dict):
                 images = batch['image'].to(device)
@@ -179,7 +185,7 @@ def setup_ddp(args):
     return args.local_rank == 0  # is_main_process
 
 
-def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
+def train_epoch(model, dataloader, criterion, optimizer, scaler, device, is_main_process=True):
     """Train for one epoch"""
     model.train()
 
@@ -191,7 +197,11 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
     }
     num_batches = 0
 
-    pbar = tqdm(dataloader, desc="Training")
+    # Only show progress bar on main process
+    if is_main_process:
+        pbar = tqdm(dataloader, desc="Training")
+    else:
+        pbar = dataloader
 
     for batch in pbar:
         # Handle both tuple and dict formats
@@ -227,11 +237,12 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
                 loss_components[key] += loss_dict[key]
         num_batches += 1
 
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'tversky': f"{loss_dict.get('tversky', 0):.4f}"
-        })
+        # Update progress bar (only on main process)
+        if is_main_process:
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'tversky': f"{loss_dict.get('tversky', 0):.4f}"
+            })
 
     # Compute averages
     avg_loss = total_loss / num_batches
@@ -485,7 +496,7 @@ def main():
 
         # Train
         avg_loss, loss_components = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, device
+            model, train_loader, criterion, optimizer, scaler, device, is_main_process
         )
 
         if is_main_process:
@@ -512,7 +523,7 @@ def main():
                 print("\nValidating...")
 
             best_metrics, threshold_results, diagnostics = validate_multi_threshold(
-                model, val_loader, device, thresholds=[0.3, 0.4, 0.5]
+                model, val_loader, device, thresholds=[0.3, 0.4, 0.5], is_main_process=is_main_process
             )
 
             if is_main_process:
