@@ -34,7 +34,7 @@ from torchvision.transforms import functional as TF
 
 from models.expert_architectures import SINetExpert
 from data.dataset import COD10KDataset
-from losses.tversky_loss import CombinedSingleExpertLoss
+from losses.aggressive_loss import AggressiveCombinedLoss
 from metrics.cod_metrics import CODMetrics
 import timm
 
@@ -146,7 +146,7 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
         'mean_pred': mean_pred,
         'min_pred': min_pred,
         'max_pred': max_pred,
-        'warning': mean_pred < 0.2
+        'warning': mean_pred < 0.25
     }
 
     # Evaluate at each threshold
@@ -191,9 +191,9 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, is_main
 
     total_loss = 0.0
     loss_components = {
-        'tversky': 0.0,
-        'bce': 0.0,
-        'ssim': 0.0
+        'focal_tversky': 0.0,
+        'asym_bce': 0.0,
+        'confidence': 0.0
     }
     num_batches = 0
 
@@ -241,7 +241,7 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, is_main
         if is_main_process:
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
-                'tversky': f"{loss_dict.get('tversky', 0):.4f}"
+                'ftv': f"{loss_dict.get('focal_tversky', 0):.4f}"
             })
 
     # Compute averages
@@ -281,15 +281,23 @@ def main():
     parser.add_argument('--warmup-epochs', type=int, default=5,
                        help='Warmup epochs (default: 5)')
 
-    # Loss
-    parser.add_argument('--tversky-weight', type=float, default=2.0,
-                       help='Tversky loss weight (default: 2.0)')
-    parser.add_argument('--bce-weight', type=float, default=1.0,
-                       help='BCE loss weight (default: 1.0)')
-    parser.add_argument('--ssim-weight', type=float, default=0.5,
-                       help='SSIM loss weight (default: 0.5)')
-    parser.add_argument('--pos-weight', type=float, default=3.0,
-                       help='Positive pixel weight (default: 3.0)')
+    # Aggressive Loss Arguments
+    parser.add_argument('--focal-tversky-weight', type=float, default=3.0,
+                       help='Focal Tversky loss weight (default: 3.0)')
+    parser.add_argument('--asym-bce-weight', type=float, default=1.0,
+                       help='Asymmetric BCE loss weight (default: 1.0)')
+    parser.add_argument('--confidence-weight', type=float, default=0.5,
+                       help='Confidence penalty weight (default: 0.5)')
+    parser.add_argument('--alpha', type=float, default=0.2,
+                       help='Tversky alpha (FP weight) (default: 0.2)')
+    parser.add_argument('--beta', type=float, default=0.8,
+                       help='Tversky beta (FN weight) (default: 0.8)')
+    parser.add_argument('--gamma', type=float, default=2.0,
+                       help='Focal gamma parameter (default: 2.0)')
+    parser.add_argument('--pos-weight', type=float, default=10.0,
+                       help='BCE positive pixel weight (default: 10.0)')
+    parser.add_argument('--neg-weight', type=float, default=0.5,
+                       help='BCE negative pixel weight (default: 0.5)')
 
     # Checkpointing
     parser.add_argument('--checkpoint-dir', type=str, default='./checkpoints_single',
@@ -329,7 +337,7 @@ def main():
 
     if is_main_process:
         print(f"\n{'='*70}")
-        print("SINGLE SINET EXPERT TRAINING - DIAGNOSTIC")
+        print("SINGLE SINET EXPERT TRAINING - AGGRESSIVE MODE")
         print(f"{'='*70}")
         print(f"Device: {device}")
         print(f"DDP: {args.use_ddp} (world_size={args.world_size})")
@@ -337,10 +345,11 @@ def main():
         print(f"Batch size: {args.batch_size}")
         print(f"Epochs: {args.epochs}")
         print(f"Learning rate: {args.lr}")
-        print(f"\nLoss weights:")
-        print(f"  Tversky: {args.tversky_weight} ⭐")
-        print(f"  BCE:     {args.bce_weight} (pos_weight={args.pos_weight})")
-        print(f"  SSIM:    {args.ssim_weight}")
+        print(f"\nAggressive Loss Configuration:")
+        print(f"  Focal Tversky: {args.focal_tversky_weight} (α={args.alpha}, β={args.beta}, γ={args.gamma})")
+        print(f"  Asymmetric BCE: {args.asym_bce_weight} (pos={args.pos_weight}, neg={args.neg_weight})")
+        print(f"  Confidence:    {args.confidence_weight}")
+        print(f"  Total weight:  {args.focal_tversky_weight + args.asym_bce_weight + args.confidence_weight}")
         print(f"{'='*70}\n")
 
     # Create checkpoint dir
@@ -425,13 +434,17 @@ def main():
             find_unused_parameters=False
         )
 
-    # Create loss
+    # Create aggressive loss
     if is_main_process:
-        criterion = CombinedSingleExpertLoss(
-            tversky_weight=args.tversky_weight,
-            bce_weight=args.bce_weight,
-            ssim_weight=args.ssim_weight,
-            pos_weight=args.pos_weight
+        criterion = AggressiveCombinedLoss(
+            focal_tversky_weight=args.focal_tversky_weight,
+            asym_bce_weight=args.asym_bce_weight,
+            confidence_weight=args.confidence_weight,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            pos_weight=args.pos_weight,
+            neg_weight=args.neg_weight
         )
     else:
         # Create loss without printing (for non-main processes)
@@ -439,11 +452,15 @@ def main():
         import sys
         old_stdout = sys.stdout
         sys.stdout = io.StringIO()
-        criterion = CombinedSingleExpertLoss(
-            tversky_weight=args.tversky_weight,
-            bce_weight=args.bce_weight,
-            ssim_weight=args.ssim_weight,
-            pos_weight=args.pos_weight
+        criterion = AggressiveCombinedLoss(
+            focal_tversky_weight=args.focal_tversky_weight,
+            asym_bce_weight=args.asym_bce_weight,
+            confidence_weight=args.confidence_weight,
+            alpha=args.alpha,
+            beta=args.beta,
+            gamma=args.gamma,
+            pos_weight=args.pos_weight,
+            neg_weight=args.neg_weight
         )
         sys.stdout = old_stdout
 
@@ -544,7 +561,7 @@ def main():
                 print(f"  Max:  {diagnostics['max_pred']:.4f}")
 
                 if diagnostics['warning']:
-                    print(f"  ⚠️  WARNING: Mean prediction < 0.2 (under-confident model)")
+                    print(f"  ⚠️  WARNING: Mean prediction < 0.25 (under-confident model!)")
 
                 history['val_metrics'].append(best_metrics)
                 history['diagnostics'].append(diagnostics)
