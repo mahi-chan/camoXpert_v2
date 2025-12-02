@@ -485,6 +485,9 @@ def main():
 
     # Training loop
     for epoch in range(args.epochs):
+        import time
+        epoch_start = time.time()
+
         # Set epoch for distributed sampler
         if args.use_ddp:
             train_sampler.set_epoch(epoch)
@@ -495,12 +498,14 @@ def main():
             print(f"{'='*70}")
 
         # Train
+        train_start = time.time()
         avg_loss, loss_components = train_epoch(
             model, train_loader, criterion, optimizer, scaler, device, is_main_process
         )
+        train_time = time.time() - train_start
 
         if is_main_process:
-            print(f"\nTraining Loss: {avg_loss:.4f}")
+            print(f"\nTraining Loss: {avg_loss:.4f} (time: {train_time:.1f}s)")
             print("Loss Components:")
             for key, value in loss_components.items():
                 print(f"  {key}: {value:.4f}")
@@ -567,6 +572,11 @@ def main():
                 'best_iou': best_iou,
                 'args': vars(args)
             }, checkpoint_dir / f'checkpoint_epoch_{epoch+1}.pth')
+
+        # Print epoch time
+        epoch_time = time.time() - epoch_start
+        if is_main_process:
+            print(f"\n⏱️  Epoch time: {epoch_time:.1f}s ({epoch_time/60:.1f}min)")
 
     # Save final model
     if is_main_process:
