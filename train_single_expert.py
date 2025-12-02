@@ -342,16 +342,14 @@ def main():
         root_dir=args.data_root,
         split='train',
         img_size=args.image_size,
-        augment=True,
-        cache_in_memory=True
+        augment=True
     )
 
     val_dataset = COD10KDataset(
         root_dir=args.data_root,
         split='val',
         img_size=args.image_size,
-        augment=False,
-        cache_in_memory=True
+        augment=False
     )
 
     # Samplers for DDP
