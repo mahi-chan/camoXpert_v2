@@ -101,18 +101,21 @@ class SSIMLoss(nn.Module):
         C1 = 0.01 ** 2
         C2 = 0.03 ** 2
 
+        # Ensure window is on correct device and dtype (for AMP compatibility)
+        window = self.window.to(device=pred.device, dtype=pred.dtype)
+
         # Mean
-        mu1 = F.conv2d(pred, self.window, padding=self.window_size // 2, groups=self.channel)
-        mu2 = F.conv2d(target, self.window, padding=self.window_size // 2, groups=self.channel)
+        mu1 = F.conv2d(pred, window, padding=self.window_size // 2, groups=self.channel)
+        mu2 = F.conv2d(target, window, padding=self.window_size // 2, groups=self.channel)
 
         mu1_sq = mu1.pow(2)
         mu2_sq = mu2.pow(2)
         mu1_mu2 = mu1 * mu2
 
         # Variance and covariance
-        sigma1_sq = F.conv2d(pred * pred, self.window, padding=self.window_size // 2, groups=self.channel) - mu1_sq
-        sigma2_sq = F.conv2d(target * target, self.window, padding=self.window_size // 2, groups=self.channel) - mu2_sq
-        sigma12 = F.conv2d(pred * target, self.window, padding=self.window_size // 2, groups=self.channel) - mu1_mu2
+        sigma1_sq = F.conv2d(pred * pred, window, padding=self.window_size // 2, groups=self.channel) - mu1_sq
+        sigma2_sq = F.conv2d(target * target, window, padding=self.window_size // 2, groups=self.channel) - mu2_sq
+        sigma12 = F.conv2d(pred * target, window, padding=self.window_size // 2, groups=self.channel) - mu1_mu2
 
         # SSIM
         ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
