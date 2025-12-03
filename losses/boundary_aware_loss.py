@@ -135,7 +135,7 @@ class PerExpertLoss(nn.Module):
         if not expert_preds:
             return torch.tensor(0.0, device=target.device)
 
-        total_loss = 0
+        total_loss = torch.tensor(0.0, device=target.device, dtype=torch.float32)
         for pred in expert_preds:
             if pred.shape[2:] != target.shape[2:]:
                 pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
@@ -170,7 +170,7 @@ class AntiCollapseLoss(nn.Module):
     def forward(self, pred, target):
         B = pred.shape[0]
 
-        total_loss = 0
+        total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         for i in range(B):
             target_fg_ratio = target[i].mean()
             pred_fg_ratio = pred[i].mean()
