@@ -169,7 +169,6 @@ class PerExpertLoss(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.bce = nn.BCELoss()
         self.dice = DiceLoss()
 
     def forward(self, expert_preds, target):
@@ -187,7 +186,9 @@ class PerExpertLoss(nn.Module):
 
             pred = torch.sigmoid(pred) if pred.min() < 0 else pred  # Apply sigmoid if logits
 
-            bce = self.bce(pred, target)
+            # BCE loss (autocast-safe)
+            with torch.amp.autocast('cuda', enabled=False):
+                bce = F.binary_cross_entropy(pred.float(), target.float())
             dice = self.dice(pred, target)
 
             total_loss += (bce + dice)
