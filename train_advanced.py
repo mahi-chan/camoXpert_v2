@@ -171,6 +171,8 @@ def parse_args():
                         help='Checkpoint directory')
     parser.add_argument('--save-interval', type=int, default=5,
                         help='Save checkpoint every N epochs')
+    parser.add_argument('--val-freq', type=int, default=1,
+                        help='Run validation every N epochs (default: 1 = every epoch)')
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Resume from checkpoint')
 
@@ -646,8 +648,13 @@ def train_epoch_with_additional_losses(
 
             # Handle load balancing (already included in CombinedEnhancedLoss, but update tracker)
             if trainer.enable_load_balancing and aux_outputs is not None and isinstance(aux_outputs, dict):
-                routing_probs = aux_outputs.get('routing_probs') or aux_outputs.get('expert_probs')
-                expert_assignments = aux_outputs.get('expert_assignments') or aux_outputs.get('top_k_indices')
+                routing_probs = aux_outputs.get('routing_probs')
+                if routing_probs is None:
+                    routing_probs = aux_outputs.get('expert_probs')
+
+                expert_assignments = aux_outputs.get('expert_assignments')
+                if expert_assignments is None:
+                    expert_assignments = aux_outputs.get('top_k_indices')
 
                 if routing_probs is not None and expert_assignments is not None:
                     trainer.load_balancer.update(routing_probs, expert_assignments)
@@ -676,8 +683,13 @@ def train_epoch_with_additional_losses(
 
         # Update expert collapse detector
         if trainer.enable_collapse_detection and aux_outputs is not None and isinstance(aux_outputs, dict):
-            routing_probs = aux_outputs.get('routing_probs') or aux_outputs.get('expert_probs')
-            expert_assignments = aux_outputs.get('expert_assignments') or aux_outputs.get('top_k_indices')
+            routing_probs = aux_outputs.get('routing_probs')
+            if routing_probs is None:
+                routing_probs = aux_outputs.get('expert_probs')
+
+            expert_assignments = aux_outputs.get('expert_assignments')
+            if expert_assignments is None:
+                expert_assignments = aux_outputs.get('top_k_indices')
 
             if routing_probs is not None and expert_assignments is not None:
                 with torch.no_grad():
@@ -913,21 +925,30 @@ def main():
             multi_scale_processor, boundary_refinement, args
         )
 
-        # Validate
-        val_metrics = trainer.validate(
-            val_loader,
-            metrics_fn=compute_metrics
-        )
+        # Validate (run every val_freq epochs, or on last epoch, or on first epoch)
+        should_validate = ((epoch + 1) % args.val_freq == 0) or (epoch == 0) or (epoch == args.epochs - 1)
+
+        if should_validate:
+            val_metrics = trainer.validate(
+                val_loader,
+                metrics_fn=compute_metrics
+            )
+        else:
+            # Skip validation, use previous metrics
+            val_metrics = None
 
         # Print results (main process only)
         if is_main_process:
             print(f"\nEpoch [{epoch}/{args.epochs}] Results:")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
-            print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-            print(f"  Val S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
-            print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
-            print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
-            print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
+            if val_metrics is not None:
+                print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
+                print(f"  Val S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
+                print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
+                print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
+                print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
+            else:
+                print(f"  Validation skipped (running every {args.val_freq} epochs)")
             print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
             # TDD/GAD/BPN component losses (integrated in model)
@@ -952,13 +973,14 @@ def main():
 
         # Save checkpoints (main process only)
         if is_main_process:
-            # Save best model based on S-measure (higher is better)
-            current_smeasure = val_metrics['val_s_measure']
-            if current_smeasure > best_smeasure:
-                best_smeasure = current_smeasure
-                best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
-                trainer.save_checkpoint(best_path, epoch, val_metrics)
-                print(f"✓ Saved best model (S-measure: {best_smeasure:.4f})")
+            # Save best model based on S-measure (higher is better) - only when we have validation metrics
+            if val_metrics is not None:
+                current_smeasure = val_metrics['val_s_measure']
+                if current_smeasure > best_smeasure:
+                    best_smeasure = current_smeasure
+                    best_path = os.path.join(args.checkpoint_dir, 'best_model.pth')
+                    trainer.save_checkpoint(best_path, epoch, val_metrics)
+                    print(f"✓ Saved best model (S-measure: {best_smeasure:.4f})")
 
             # Save periodic checkpoint
             if (epoch + 1) % args.save_interval == 0:
