@@ -47,8 +47,9 @@ class BoundaryAwareLoss(nn.Module):
         # Extract boundary from GT
         boundary = self._extract_boundary(target)
 
-        # Per-pixel BCE loss
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        # Per-pixel BCE loss (autocast-safe)
+        with torch.amp.autocast('cuda', enabled=False):
+            bce = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
 
         # Weight by boundary proximity
         weight_map = 1.0 + self.boundary_weight * boundary
@@ -112,8 +113,9 @@ class BoundaryPredictionLoss(nn.Module):
         pos_ratio = target_boundary.sum() / (target_boundary.numel() + 1e-6)
         pos_weight = torch.clamp((1 - pos_ratio) / (pos_ratio + 1e-6), 1, 50)
 
-        # BCE with positive weighting
-        bce = F.binary_cross_entropy(pred_boundary, target_boundary, reduction='none')
+        # BCE with positive weighting (autocast-safe)
+        with torch.amp.autocast('cuda', enabled=False):
+            bce = F.binary_cross_entropy(pred_boundary.float(), target_boundary.float(), reduction='none')
         weighted_bce = bce * (1 + (pos_weight - 1) * target_boundary)
         bce_loss = weighted_bce.mean()
 
@@ -153,8 +155,9 @@ class DiscontinuitySupervisionLoss(nn.Module):
         target_boundary = F.max_pool2d(target_boundary, 5, stride=1, padding=2)
         target_boundary = torch.clamp(target_boundary, 0, 1)
 
-        # BCE loss
-        loss = F.binary_cross_entropy(discontinuity_map, target_boundary)
+        # BCE loss (autocast-safe)
+        with torch.amp.autocast('cuda', enabled=False):
+            loss = F.binary_cross_entropy(discontinuity_map.float(), target_boundary.float())
 
         return loss
 
@@ -200,8 +203,9 @@ class HardSampleMiningLoss(nn.Module):
         self.hard_ratio = hard_ratio
 
     def forward(self, pred, target):
-        # Per-pixel loss
-        pixel_loss = F.binary_cross_entropy(pred, target, reduction='none')
+        # Per-pixel loss (autocast-safe)
+        with torch.amp.autocast('cuda', enabled=False):
+            pixel_loss = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
 
         B, C, H, W = pixel_loss.shape
         k = max(int(self.hard_ratio * H * W), 100)
