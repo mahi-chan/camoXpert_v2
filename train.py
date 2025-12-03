@@ -222,8 +222,14 @@ def validate_multi_threshold(model, dataloader, device, thresholds=[0.3, 0.4, 0.
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating", leave=False, disable=(rank != 0)):
-            images = batch['image'].to(device)
-            masks = batch['mask'].to(device)
+            # Handle tuple or dict batch format
+            if isinstance(batch, dict):
+                images = batch['image'].to(device)
+                masks = batch['mask'].to(device)
+            else:
+                images, masks = batch
+                images = images.to(device)
+                masks = masks.to(device)
 
             # Forward pass
             output = model(images)
@@ -292,8 +298,14 @@ def train_epoch(model, dataloader, criterion, optimizer, scaler, device, ema, mi
     optimizer.zero_grad()
 
     for batch_idx, batch in enumerate(pbar):
-        images = batch['image'].to(device)
-        masks = batch['mask'].to(device)
+        # Handle tuple or dict batch format
+        if isinstance(batch, dict):
+            images = batch['image'].to(device)
+            masks = batch['mask'].to(device)
+        else:
+            images, masks = batch
+            images = images.to(device)
+            masks = masks.to(device)
 
         # Apply mixup augmentation
         if use_mixup and random.random() > 0.5:
@@ -511,17 +523,23 @@ def main():
         print("Loading datasets...")
 
     train_dataset = COD10KDataset(
-        root=args.data_root,
+        root_dir=args.data_root,
         split='train',
-        image_size=args.img_size,
-        augmentation=True
+        img_size=args.img_size,
+        augment=True,
+        cache_in_memory=not args.no_cache,
+        rank=rank,
+        world_size=world_size
     )
 
     val_dataset = COD10KDataset(
-        root=args.data_root,
-        split='val',
-        image_size=args.img_size,
-        augmentation=False
+        root_dir=args.data_root,
+        split='test',  # Use 'test' split for validation
+        img_size=args.img_size,
+        augment=False,
+        cache_in_memory=not args.no_cache,
+        rank=rank,
+        world_size=world_size
     )
 
     # Create samplers for DDP
