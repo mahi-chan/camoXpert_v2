@@ -55,8 +55,9 @@ class FocalLoss(nn.Module):
     def forward(self, pred, target):
         pred = torch.clamp(pred, 1e-7, 1 - 1e-7)
 
-        # Binary focal loss
-        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        # Binary focal loss (autocast-safe)
+        with torch.amp.autocast('cuda', enabled=False):
+            bce = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
         pt = torch.where(target == 1, pred, 1 - pred)
 
         # Alpha weighting: more weight to foreground
@@ -115,7 +116,9 @@ class BoundaryLoss(nn.Module):
         target_boundary = self._extract_boundary(target_mask)
         pred_boundary = torch.clamp(pred_boundary, 1e-7, 1 - 1e-7)
 
-        bce = F.binary_cross_entropy(pred_boundary, target_boundary)
+        # BCE with autocast safety
+        with torch.amp.autocast('cuda', enabled=False):
+            bce = F.binary_cross_entropy(pred_boundary.float(), target_boundary.float())
         dice = self.dice(pred_boundary, target_boundary)
 
         return bce + dice
@@ -142,7 +145,9 @@ class PerExpertLoss(nn.Module):
                 pred = torch.sigmoid(pred)
             pred = torch.clamp(pred, 1e-7, 1 - 1e-7)
 
-            bce = F.binary_cross_entropy(pred, target)
+            # BCE with autocast safety
+            with torch.amp.autocast('cuda', enabled=False):
+                bce = F.binary_cross_entropy(pred.float(), target.float())
             dice = self.dice(pred, target)
             iou = self.iou(pred, target)
 
@@ -216,7 +221,7 @@ class CombinedEnhancedLoss(nn.Module):
         self.discontinuity_weight = discontinuity_weight
 
         # Core losses (proven to work)
-        self.bce = nn.BCELoss()
+        # Note: Using F.binary_cross_entropy instead of nn.BCELoss for autocast safety
         self.dice = DiceLoss()
         self.iou = IoULoss()
         self.focal = FocalLoss(alpha=0.25, gamma=2.0)
@@ -262,7 +267,9 @@ class CombinedEnhancedLoss(nn.Module):
         # ============================================================
         # 1. MAIN SEGMENTATION LOSS (proven components)
         # ============================================================
-        bce_loss = self.bce(pred_sig, target)
+        # BCE with autocast safety
+        with torch.amp.autocast('cuda', enabled=False):
+            bce_loss = F.binary_cross_entropy(pred_sig.float(), target.float())
         dice_loss = self.dice(pred_sig, target)
         iou_loss = self.iou(pred_sig, target)
         focal_loss = self.focal(pred_sig, target)
