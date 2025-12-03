@@ -47,6 +47,9 @@ class BoundaryAwareLoss(nn.Module):
         # Extract boundary from GT
         boundary = self._extract_boundary(target)
 
+        # Clamp pred to avoid log(0) in BCE
+        pred = torch.clamp(pred, 1e-6, 1 - 1e-6)
+
         # Per-pixel BCE loss (autocast-safe)
         with torch.amp.autocast('cuda', enabled=False):
             bce = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
@@ -111,7 +114,7 @@ class BoundaryPredictionLoss(nn.Module):
 
         # Positive weight for imbalanced boundary pixels
         pos_ratio = target_boundary.sum() / (target_boundary.numel() + 1e-6)
-        pos_weight = torch.clamp((1 - pos_ratio) / (pos_ratio + 1e-6), 1, 50)
+        pos_weight = torch.clamp((1 - pos_ratio) / (pos_ratio + 1e-6), 1, 10)  # Reduced from 50 to 10
 
         # BCE with positive weighting (autocast-safe)
         with torch.amp.autocast('cuda', enabled=False):
@@ -130,6 +133,10 @@ class DiscontinuitySupervisionLoss(nn.Module):
     Supervises TDD and GAD outputs.
     Target: Discontinuity should be high at object boundaries.
     """
+    def __init__(self, label_smoothing=0.1):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+
     def forward(self, discontinuity_map, target_mask):
         """
         Args:
@@ -154,6 +161,12 @@ class DiscontinuitySupervisionLoss(nn.Module):
         # Expand boundary region
         target_boundary = F.max_pool2d(target_boundary, 5, stride=1, padding=2)
         target_boundary = torch.clamp(target_boundary, 0, 1)
+
+        # Apply label smoothing to prevent extreme BCE values
+        target_boundary = target_boundary * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+
+        # Clamp predictions to avoid log(0)
+        discontinuity_map = torch.clamp(discontinuity_map, 1e-6, 1 - 1e-6)
 
         # BCE loss (autocast-safe)
         with torch.amp.autocast('cuda', enabled=False):
@@ -234,7 +247,7 @@ class CombinedEnhancedLoss(nn.Module):
         self,
         seg_weight=1.0,
         boundary_weight=2.0,
-        discontinuity_weight=0.3,
+        discontinuity_weight=0.1,  # Reduced from 0.3 to 0.1
         expert_weight=0.3,
         hard_mining_weight=0.5,
         load_balance_weight=0.1

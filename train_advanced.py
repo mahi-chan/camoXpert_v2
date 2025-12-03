@@ -417,7 +417,7 @@ def create_optimizer_and_criterion(model, args, is_main_process):
     enhanced_loss_fn = CombinedEnhancedLoss(
         seg_weight=1.0,
         boundary_weight=2.0,
-        discontinuity_weight=0.3,
+        discontinuity_weight=0.1,  # Reduced from 0.3 to 0.1
         expert_weight=0.3,
         hard_mining_weight=0.5,
         load_balance_weight=0.1
@@ -449,7 +449,7 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
         print(f"✓ Loss: CombinedEnhancedLoss (boundary-aware + TDD/GAD/BPN)")
         print(f"    Segmentation: 1.0, Boundary: 2.0 ⭐")
-        print(f"    Discontinuity (TDD+GAD): 0.3, Per-Expert: 0.3")
+        print(f"    Discontinuity (TDD+GAD): 0.1, Per-Expert: 0.3")
         print(f"    Hard Mining: 0.5, Load Balance: 0.1")
 
     return optimizer, criterion
