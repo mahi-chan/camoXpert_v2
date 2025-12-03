@@ -412,14 +412,14 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         betas=(0.9, 0.999)
     )
 
-    # Production loss configuration - SOTA-focused
+    # Production loss configuration - AGGRESSIVE for 0.89+ S-measure
     enhanced_loss_fn = CombinedEnhancedLoss(
-        seg_weight=1.0,
-        boundary_weight=0.3,
-        expert_weight=0.5,
-        anti_collapse_weight=2.0,
-        load_balance_weight=0.05,
-        discontinuity_weight=0.0,  # DISABLED - TDD/GAD provide features only
+        seg_weight=1.2,              # Increased from 1.0 - stronger main supervision
+        boundary_weight=0.5,         # Increased from 0.3 - better boundaries
+        expert_weight=0.7,           # Increased from 0.5 - all experts learn well
+        anti_collapse_weight=3.0,    # Increased from 2.0 - MORE stability
+        load_balance_weight=0.08,    # Increased from 0.05 - better routing
+        discontinuity_weight=0.0,    # DISABLED - TDD/GAD provide features only
     )
 
     # Wrapper to make CombinedEnhancedLoss compatible with trainer interface
@@ -446,10 +446,10 @@ def create_optimizer_and_criterion(model, args, is_main_process):
 
     if is_main_process:
         print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
-        print(f"✓ Loss: Production SOTA Configuration")
-        print(f"    Main: BCE + Dice + IoU + Focal")
-        print(f"    Boundary: 0.3, Expert: 0.5, Anti-Collapse: 2.0 ⭐")
-        print(f"    Load Balance: 0.05, TDD/GAD: DISABLED (features only)")
+        print(f"✓ Loss: AGGRESSIVE SOTA Configuration (0.89+ target)")
+        print(f"    Main: BCE + Dice + IoU + Focal (weight: 1.2)")
+        print(f"    Boundary: 0.5, Expert: 0.7, Anti-Collapse: 3.0 ⭐")
+        print(f"    Load Balance: 0.08, TDD/GAD: DISABLED (features only)")
 
     return optimizer, criterion
 
