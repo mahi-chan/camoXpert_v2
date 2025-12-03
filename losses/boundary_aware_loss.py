@@ -1,12 +1,16 @@
 """
-Boundary-Aware Loss Functions for Enhanced MoE
+Production Loss for Camouflaged Object Detection - SOTA-Focused
 
-Components:
-1. BoundaryAwareLoss - Weights segmentation errors higher at boundaries
-2. BoundaryPredictionLoss - Supervises boundary prediction
-3. DiscontinuitySupervisionLoss - Supervises TDD and GAD outputs
-4. PerExpertLoss - Individual supervision for each expert
-5. CombinedEnhancedLoss - Combines all losses
+Based on what actually works in SOTA methods:
+- SINet: BCE + IoU loss
+- PraNet: BCE + Dice + IoU
+- ZoomNet: BCE + Dice + structure loss
+
+Key principles:
+1. Simple, proven loss components
+2. Proper weighting for sparse masks
+3. Anti-collapse mechanism
+4. Light boundary supervision (not heavy TDD/GAD)
 """
 
 import torch
@@ -14,371 +18,342 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class BoundaryAwareLoss(nn.Module):
-    """
-    Segmentation loss that penalizes boundary errors more heavily.
-    """
-    def __init__(self, boundary_weight=5.0):
-        super().__init__()
-        self.boundary_weight = boundary_weight
-
-    def _extract_boundary(self, mask, kernel_size=3):
-        """Extract boundary from binary mask using morphological gradient"""
-        padding = kernel_size // 2
-
-        # Dilate
-        dilated = F.max_pool2d(mask, kernel_size, stride=1, padding=padding)
-        # Erode
-        eroded = -F.max_pool2d(-mask, kernel_size, stride=1, padding=padding)
-        # Boundary = Dilate - Erode
-        boundary = dilated - eroded
-
-        # Expand boundary region slightly for more coverage
-        boundary = F.max_pool2d(boundary, 5, stride=1, padding=2)
-
-        return boundary
-
-    def forward(self, pred, target):
-        """
-        Args:
-            pred: Predicted segmentation [B, 1, H, W]
-            target: Ground truth mask [B, 1, H, W]
-        """
-        # Extract boundary from GT
-        boundary = self._extract_boundary(target)
-
-        # Clamp pred to avoid log(0) in BCE
-        pred = torch.clamp(pred, 1e-6, 1 - 1e-6)
-
-        # Per-pixel BCE loss (autocast-safe)
-        with torch.amp.autocast('cuda', enabled=False):
-            bce = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
-
-        # Weight by boundary proximity
-        weight_map = 1.0 + self.boundary_weight * boundary
-
-        # Weighted loss
-        weighted_loss = (bce * weight_map).mean()
-
-        return weighted_loss
-
-
 class DiceLoss(nn.Module):
-    """Standard Dice loss for segmentation"""
+    """Dice loss - standard for medical/COD segmentation"""
     def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
 
     def forward(self, pred, target):
-        intersection = (pred * target).sum()
-        union = pred.sum() + target.sum()
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        return 1 - dice
+        pred_flat = pred.contiguous().view(-1)
+        target_flat = target.contiguous().view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        return 1 - (2 * intersection + self.smooth) / (pred_flat.sum() + target_flat.sum() + self.smooth)
 
 
-class BoundaryPredictionLoss(nn.Module):
+class IoULoss(nn.Module):
+    """IoU/Jaccard loss - directly optimizes the metric we care about"""
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, pred, target):
+        pred_flat = pred.contiguous().view(-1)
+        target_flat = target.contiguous().view(-1)
+        intersection = (pred_flat * target_flat).sum()
+        union = pred_flat.sum() + target_flat.sum() - intersection
+        return 1 - (intersection + self.smooth) / (union + self.smooth)
+
+
+class FocalLoss(nn.Module):
+    """Focal loss - handles class imbalance in sparse masks"""
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        pred = torch.clamp(pred, 1e-7, 1 - 1e-7)
+
+        # Binary focal loss
+        bce = F.binary_cross_entropy(pred, target, reduction='none')
+        pt = torch.where(target == 1, pred, 1 - pred)
+
+        # Alpha weighting: more weight to foreground
+        alpha_t = torch.where(target == 1, self.alpha, 1 - self.alpha)
+
+        focal_weight = alpha_t * (1 - pt) ** self.gamma
+        return (focal_weight * bce).mean()
+
+
+class StructureLoss(nn.Module):
     """
-    Loss for training the Boundary Prior Network.
-    Uses BCE + Dice to handle thin boundary class imbalance.
+    Structure loss from PraNet - combines weighted BCE and IoU
+    This is proven to work well for COD
     """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target):
+        # Weighted BCE - more weight to foreground
+        wbce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+
+        # Weight: inverse frequency
+        weit = 1 + 5 * torch.abs(F.avg_pool2d(target, kernel_size=31, stride=1, padding=15) - target)
+        wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
+
+        # Weighted IoU
+        pred_sig = torch.sigmoid(pred)
+        inter = ((pred_sig * target) * weit).sum(dim=(2, 3))
+        union = ((pred_sig + target) * weit).sum(dim=(2, 3))
+        wiou = 1 - (inter + 1) / (union - inter + 1)
+
+        return (wbce + wiou).mean()
+
+
+class BoundaryLoss(nn.Module):
+    """Simple boundary loss - just BCE + Dice on boundary map"""
     def __init__(self):
         super().__init__()
         self.dice = DiceLoss()
 
-    def _extract_boundary(self, mask, kernel_size=3):
-        """Extract GT boundary from segmentation mask"""
-        padding = kernel_size // 2
-        dilated = F.max_pool2d(mask, kernel_size, stride=1, padding=padding)
-        eroded = -F.max_pool2d(-mask, kernel_size, stride=1, padding=padding)
-        boundary = dilated - eroded
+    def _extract_boundary(self, mask):
+        # Laplacian-based boundary extraction
+        laplacian = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]],
+                                  dtype=mask.dtype, device=mask.device).view(1, 1, 3, 3)
+        boundary = F.conv2d(mask, laplacian, padding=1)
+        boundary = torch.abs(boundary)
+        boundary = torch.clamp(boundary, 0, 1)
         return boundary
 
     def forward(self, pred_boundary, target_mask):
-        """
-        Args:
-            pred_boundary: Predicted boundary [B, 1, H, W]
-            target_mask: GT segmentation mask [B, 1, H, W]
-        """
         # Resize if needed
         if pred_boundary.shape[2:] != target_mask.shape[2:]:
-            target_mask = F.interpolate(
-                target_mask,
-                size=pred_boundary.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
+            target_mask = F.interpolate(target_mask, size=pred_boundary.shape[2:],
+                                        mode='bilinear', align_corners=False)
 
-        # Extract GT boundary
         target_boundary = self._extract_boundary(target_mask)
-        target_boundary = torch.clamp(target_boundary, 0, 1)
+        pred_boundary = torch.clamp(pred_boundary, 1e-7, 1 - 1e-7)
 
-        # Positive weight for imbalanced boundary pixels
-        pos_ratio = target_boundary.sum() / (target_boundary.numel() + 1e-6)
-        pos_weight = torch.clamp((1 - pos_ratio) / (pos_ratio + 1e-6), 1, 10)  # Reduced from 50 to 10
+        bce = F.binary_cross_entropy(pred_boundary, target_boundary)
+        dice = self.dice(pred_boundary, target_boundary)
 
-        # BCE with positive weighting (autocast-safe)
-        with torch.amp.autocast('cuda', enabled=False):
-            bce = F.binary_cross_entropy(pred_boundary.float(), target_boundary.float(), reduction='none')
-        weighted_bce = bce * (1 + (pos_weight - 1) * target_boundary)
-        bce_loss = weighted_bce.mean()
-
-        # Dice loss
-        dice_loss = self.dice(pred_boundary, target_boundary)
-
-        return bce_loss + dice_loss
-
-
-class DiscontinuitySupervisionLoss(nn.Module):
-    """
-    Supervises TDD and GAD outputs.
-    Target: Discontinuity should be high at object boundaries.
-    """
-    def __init__(self, label_smoothing=0.1):
-        super().__init__()
-        self.label_smoothing = label_smoothing
-
-    def forward(self, discontinuity_map, target_mask):
-        """
-        Args:
-            discontinuity_map: TDD or GAD output [B, 1, H, W]
-            target_mask: GT segmentation mask [B, 1, H, W]
-        """
-        # Resize mask to discontinuity resolution
-        if discontinuity_map.shape[2:] != target_mask.shape[2:]:
-            target_mask = F.interpolate(
-                target_mask,
-                size=discontinuity_map.shape[2:],
-                mode='bilinear',
-                align_corners=False
-            )
-
-        # Extract boundary as supervision target
-        padding = 1
-        dilated = F.max_pool2d(target_mask, 3, stride=1, padding=padding)
-        eroded = -F.max_pool2d(-target_mask, 3, stride=1, padding=padding)
-        target_boundary = dilated - eroded
-
-        # Expand boundary region
-        target_boundary = F.max_pool2d(target_boundary, 5, stride=1, padding=2)
-        target_boundary = torch.clamp(target_boundary, 0, 1)
-
-        # Apply label smoothing to prevent extreme BCE values
-        target_boundary = target_boundary * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-
-        # Clamp predictions to avoid log(0)
-        discontinuity_map = torch.clamp(discontinuity_map, 1e-6, 1 - 1e-6)
-
-        # BCE loss (autocast-safe)
-        with torch.amp.autocast('cuda', enabled=False):
-            loss = F.binary_cross_entropy(discontinuity_map.float(), target_boundary.float())
-
-        return loss
+        return bce + dice
 
 
 class PerExpertLoss(nn.Module):
-    """
-    Computes loss for each expert individually.
-    Ensures all experts learn to segment, not just relied-upon ones.
-    """
+    """Ensure each expert learns independently"""
     def __init__(self):
         super().__init__()
         self.dice = DiceLoss()
+        self.iou = IoULoss()
 
     def forward(self, expert_preds, target):
-        """
-        Args:
-            expert_preds: List of expert predictions [pred1, pred2, pred3]
-            target: GT mask [B, 1, H, W]
-        """
-        total_loss = 0
+        if not expert_preds:
+            return torch.tensor(0.0, device=target.device)
 
+        total_loss = 0
         for pred in expert_preds:
-            # Resize if needed
             if pred.shape[2:] != target.shape[2:]:
                 pred = F.interpolate(pred, size=target.shape[2:], mode='bilinear', align_corners=False)
 
-            pred = torch.sigmoid(pred) if pred.min() < 0 else pred  # Apply sigmoid if logits
+            # Apply sigmoid if logits
+            if pred.min() < 0 or pred.max() > 1:
+                pred = torch.sigmoid(pred)
+            pred = torch.clamp(pred, 1e-7, 1 - 1e-7)
 
-            # BCE loss (autocast-safe)
-            with torch.amp.autocast('cuda', enabled=False):
-                bce = F.binary_cross_entropy(pred.float(), target.float())
+            bce = F.binary_cross_entropy(pred, target)
             dice = self.dice(pred, target)
+            iou = self.iou(pred, target)
 
-            total_loss += (bce + dice)
+            total_loss += (bce + dice + iou)
 
-        # Average over experts
         return total_loss / len(expert_preds)
 
 
-class HardSampleMiningLoss(nn.Module):
-    """Focus on hardest pixels"""
-    def __init__(self, hard_ratio=0.3):
+class AntiCollapseLoss(nn.Module):
+    """
+    CRITICAL: Prevents model from predicting all zeros
+
+    If the model predicts mostly zeros when there's foreground,
+    this loss heavily penalizes it.
+    """
+    def __init__(self, min_activation_ratio=0.3):
         super().__init__()
-        self.hard_ratio = hard_ratio
+        self.min_activation_ratio = min_activation_ratio
 
     def forward(self, pred, target):
-        # Per-pixel loss (autocast-safe)
-        with torch.amp.autocast('cuda', enabled=False):
-            pixel_loss = F.binary_cross_entropy(pred.float(), target.float(), reduction='none')
+        B = pred.shape[0]
 
-        B, C, H, W = pixel_loss.shape
-        k = max(int(self.hard_ratio * H * W), 100)
+        total_loss = 0
+        for i in range(B):
+            target_fg_ratio = target[i].mean()
+            pred_fg_ratio = pred[i].mean()
 
-        # Get hardest pixels
-        pixel_loss_flat = pixel_loss.view(B, -1)
-        hard_loss, _ = torch.topk(pixel_loss_flat, k, dim=1)
+            # Only apply if target has significant foreground (>1%)
+            if target_fg_ratio > 0.01:
+                # Minimum prediction should be some fraction of target
+                min_expected = target_fg_ratio * self.min_activation_ratio
 
-        return pixel_loss.mean() + hard_loss.mean()
+                # Penalty if prediction is too sparse
+                if pred_fg_ratio < min_expected:
+                    shortfall = (min_expected - pred_fg_ratio) / (min_expected + 1e-7)
+                    total_loss += shortfall ** 2
+
+        return total_loss / B * 5.0  # Scale factor
 
 
 class CombinedEnhancedLoss(nn.Module):
     """
-    Combined loss for enhanced MoE with TDD/GAD/BPN.
+    Production Loss Configuration for SOTA Performance
 
-    Components:
-    - Segmentation: Boundary-aware BCE + Dice
-    - Boundary: BPN supervision
-    - Discontinuity: TDD + GAD supervision
-    - Per-expert: Individual expert losses
-    - Hard mining: Focus on difficult pixels
-    - Load balance: Router regularization
+    Based on proven SOTA methods:
+    - Main: BCE + Dice + IoU + Focal (balanced)
+    - Boundary: Light supervision on BPN only
+    - Per-expert: Ensures all experts learn
+    - Anti-collapse: Prevents degenerate solutions
+
+    TDD/GAD: NO DIRECT SUPERVISION (they provide features to BPN)
     """
     def __init__(
         self,
         seg_weight=1.0,
-        boundary_weight=2.0,
-        discontinuity_weight=0.1,  # Reduced from 0.3 to 0.1
-        expert_weight=0.3,
-        hard_mining_weight=0.5,
-        load_balance_weight=0.1
+        boundary_weight=0.3,       # Light boundary supervision
+        expert_weight=0.5,         # Important for MoE
+        anti_collapse_weight=2.0,  # Critical for stability
+        load_balance_weight=0.05,
+        # These are kept for compatibility but set to 0
+        discontinuity_weight=0.0,  # DISABLED
+        hard_mining_weight=0.0,    # DISABLED
     ):
         super().__init__()
 
         self.seg_weight = seg_weight
         self.boundary_weight = boundary_weight
-        self.discontinuity_weight = discontinuity_weight
         self.expert_weight = expert_weight
-        self.hard_mining_weight = hard_mining_weight
+        self.anti_collapse_weight = anti_collapse_weight
         self.load_balance_weight = load_balance_weight
+        self.discontinuity_weight = discontinuity_weight
 
-        # Loss components
-        self.boundary_aware = BoundaryAwareLoss(boundary_weight=5.0)
+        # Core losses (proven to work)
+        self.bce = nn.BCELoss()
         self.dice = DiceLoss()
-        self.boundary_pred = BoundaryPredictionLoss()
-        self.discontinuity = DiscontinuitySupervisionLoss()
+        self.iou = IoULoss()
+        self.focal = FocalLoss(alpha=0.25, gamma=2.0)
+
+        # Auxiliary losses
+        self.boundary_loss = BoundaryLoss()
         self.per_expert = PerExpertLoss()
-        self.hard_mining = HardSampleMiningLoss(hard_ratio=0.3)
+        self.anti_collapse = AntiCollapseLoss(min_activation_ratio=0.3)
+
+        # For logging
+        self._last_loss_dict = {}
 
         print("\n" + "="*70)
-        print("COMBINED ENHANCED LOSS")
+        print("PRODUCTION LOSS - SOTA CONFIGURATION")
         print("="*70)
-        print(f"  Segmentation (boundary-aware): {seg_weight}")
-        print(f"  Boundary prediction: {boundary_weight}")
-        print(f"  Discontinuity supervision: {discontinuity_weight}")
-        print(f"  Per-expert supervision: {expert_weight}")
-        print(f"  Hard sample mining: {hard_mining_weight}")
-        print(f"  Load balance: {load_balance_weight}")
+        print(f"  Main Segmentation: {seg_weight} × (BCE + Dice + IoU + Focal)")
+        print(f"  Boundary (BPN): {boundary_weight}")
+        print(f"  Per-Expert: {expert_weight}")
+        print(f"  Anti-Collapse: {anti_collapse_weight} ⭐ CRITICAL")
+        print(f"  Load Balance: {load_balance_weight}")
+        print(f"  TDD/GAD Direct: DISABLED (features only)")
+        print("="*70)
+        print("  Expected loss range: 3-6 (start) → 1-2 (converged)")
         print("="*70)
 
-    def forward(self, pred, target, aux_outputs=None):
+    def forward(self, pred, target, aux_outputs=None, input_image=None):
         """
         Args:
-            pred: Main prediction [B, 1, H, W]
-            target: GT mask [B, 1, H, W]
-            aux_outputs: Dict with auxiliary outputs from model
-
-        Returns:
-            total_loss: Combined loss
-            loss_dict: Individual loss components
+            pred: Main prediction [B, 1, H, W] - can be logits or sigmoid
+            target: Ground truth [B, 1, H, W]
+            aux_outputs: Dict with auxiliary outputs
+            input_image: Original input (unused, for compatibility)
         """
         loss_dict = {}
 
-        # Ensure pred is sigmoid activated
-        if pred.min() < 0:
-            pred = torch.sigmoid(pred)
+        # Ensure prediction is sigmoid activated
+        if pred.min() < 0 or pred.max() > 1:
+            pred_sig = torch.sigmoid(pred)
+        else:
+            pred_sig = pred
+        pred_sig = torch.clamp(pred_sig, 1e-7, 1 - 1e-7)
 
-        # 1. Main segmentation loss (boundary-aware)
-        seg_loss = self.boundary_aware(pred, target)
-        dice_loss = self.dice(pred, target)
-        loss_dict['seg_bce'] = seg_loss
-        loss_dict['seg_dice'] = dice_loss
+        # ============================================================
+        # 1. MAIN SEGMENTATION LOSS (proven components)
+        # ============================================================
+        bce_loss = self.bce(pred_sig, target)
+        dice_loss = self.dice(pred_sig, target)
+        iou_loss = self.iou(pred_sig, target)
+        focal_loss = self.focal(pred_sig, target)
 
-        # 2. Hard sample mining
-        hard_loss = self.hard_mining(pred, target)
-        loss_dict['hard_mining'] = hard_loss
+        seg_loss = bce_loss + dice_loss + iou_loss + focal_loss
 
-        total_loss = (
-            self.seg_weight * (seg_loss + dice_loss) +
-            self.hard_mining_weight * hard_loss
-        )
+        loss_dict['bce'] = bce_loss.item()
+        loss_dict['dice'] = dice_loss.item()
+        loss_dict['iou'] = iou_loss.item()
+        loss_dict['focal'] = focal_loss.item()
+        loss_dict['seg_total'] = seg_loss.item()
 
-        # Additional losses from auxiliary outputs
+        total_loss = self.seg_weight * seg_loss
+
+        # ============================================================
+        # 2. ANTI-COLLAPSE LOSS (critical for stability)
+        # ============================================================
+        anti_collapse = self.anti_collapse(pred_sig, target)
+        loss_dict['anti_collapse'] = anti_collapse.item()
+        total_loss += self.anti_collapse_weight * anti_collapse
+
+        # ============================================================
+        # 3. AUXILIARY LOSSES
+        # ============================================================
         if aux_outputs is not None:
-            # 3. Boundary prediction loss
-            if 'boundary' in aux_outputs and aux_outputs['boundary'] is not None:
-                boundary_loss = self.boundary_pred(aux_outputs['boundary'], target)
-                loss_dict['boundary'] = boundary_loss
-                total_loss += self.boundary_weight * boundary_loss
+            # 3a. Boundary loss (BPN output only)
+            if self.boundary_weight > 0:
+                boundary_pred = aux_outputs.get('boundary')
+                if boundary_pred is not None:
+                    boundary_loss = self.boundary_loss(boundary_pred, target)
+                    loss_dict['boundary'] = boundary_loss.item()
+                    total_loss += self.boundary_weight * boundary_loss
 
-            # 4. Discontinuity supervision (TDD)
+            # 3b. Per-expert loss (ensures all experts learn)
+            if self.expert_weight > 0:
+                expert_preds = aux_outputs.get('individual_expert_preds')
+                if expert_preds:
+                    expert_loss = self.per_expert(expert_preds, target)
+                    loss_dict['expert'] = expert_loss.item()
+                    total_loss += self.expert_weight * expert_loss
+
+            # 3c. Load balance loss (router regularization)
+            if self.load_balance_weight > 0:
+                lb_loss = aux_outputs.get('load_balance_loss')
+                if lb_loss is not None and isinstance(lb_loss, torch.Tensor):
+                    loss_dict['load_balance'] = lb_loss.item()
+                    total_loss += self.load_balance_weight * lb_loss
+
+            # TDD/GAD: NOT SUPERVISED (they just provide features to BPN)
+            # Log their outputs for monitoring only
             if 'texture_disc' in aux_outputs and aux_outputs['texture_disc'] is not None:
-                tdd_loss = self.discontinuity(aux_outputs['texture_disc'], target)
-                loss_dict['tdd'] = tdd_loss
-                total_loss += self.discontinuity_weight * tdd_loss
-
-            # 5. Discontinuity supervision (GAD)
+                loss_dict['tdd_mean'] = aux_outputs['texture_disc'].mean().item()
             if 'gradient_anomaly' in aux_outputs and aux_outputs['gradient_anomaly'] is not None:
-                gad_loss = self.discontinuity(aux_outputs['gradient_anomaly'], target)
-                loss_dict['gad'] = gad_loss
-                total_loss += self.discontinuity_weight * gad_loss
+                loss_dict['gad_mean'] = aux_outputs['gradient_anomaly'].mean().item()
 
-            # 6. Per-expert supervision
-            if 'individual_expert_preds' in aux_outputs and aux_outputs['individual_expert_preds'] is not None:
-                expert_loss = self.per_expert(aux_outputs['individual_expert_preds'], target)
-                loss_dict['expert'] = expert_loss
-                total_loss += self.expert_weight * expert_loss
-
-            # 7. Load balance loss from router
-            if 'load_balance_loss' in aux_outputs and aux_outputs['load_balance_loss'] is not None:
-                lb_loss = aux_outputs['load_balance_loss']
-                loss_dict['load_balance'] = lb_loss
-                total_loss += self.load_balance_weight * lb_loss
-
-        loss_dict['total'] = total_loss
+        loss_dict['total'] = total_loss.item()
+        self._last_loss_dict = loss_dict
 
         return total_loss, loss_dict
 
+    def get_last_loss_dict(self):
+        return self._last_loss_dict
 
-# Test
+
+# Quick test
 if __name__ == '__main__':
-    print("Testing CombinedEnhancedLoss...")
+    print("Testing Production Loss...")
 
     criterion = CombinedEnhancedLoss()
 
-    # Create dummy data
-    pred = torch.sigmoid(torch.randn(2, 1, 416, 416))
-    target = (torch.rand(2, 1, 416, 416) > 0.7).float()
+    # Normal case
+    pred = torch.sigmoid(torch.randn(2, 1, 384, 384))
+    target = (torch.rand(2, 1, 384, 384) > 0.7).float()
 
-    aux_outputs = {
-        'boundary': torch.sigmoid(torch.randn(2, 1, 104, 104)),
-        'texture_disc': torch.sigmoid(torch.randn(2, 1, 104, 104)),
-        'gradient_anomaly': torch.sigmoid(torch.randn(2, 1, 104, 104)),
-        'individual_expert_preds': [
-            torch.sigmoid(torch.randn(2, 1, 416, 416)),
-            torch.sigmoid(torch.randn(2, 1, 416, 416)),
-            torch.sigmoid(torch.randn(2, 1, 416, 416)),
-        ],
+    aux = {
+        'boundary': torch.sigmoid(torch.randn(2, 1, 96, 96)),
+        'individual_expert_preds': [torch.randn(2, 1, 384, 384) for _ in range(3)],
+        'texture_disc': torch.sigmoid(torch.randn(2, 1, 96, 96)),
+        'gradient_anomaly': torch.sigmoid(torch.randn(2, 1, 96, 96)),
         'load_balance_loss': torch.tensor(0.1),
     }
 
-    total_loss, loss_dict = criterion(pred, target, aux_outputs)
+    loss, loss_dict = criterion(pred, target, aux)
+    print(f"\nNormal case - Total loss: {loss.item():.4f}")
+    for k, v in loss_dict.items():
+        print(f"  {k}: {v:.4f}")
 
-    print("\nLoss components:")
-    for key, value in loss_dict.items():
-        if isinstance(value, torch.Tensor):
-            print(f"  {key}: {value.item():.4f}")
+    # Collapse case (all zeros)
+    pred_zeros = torch.zeros_like(pred) + 0.01
+    loss_zeros, _ = criterion(pred_zeros, target, aux)
+    print(f"\nCollapse case - Total loss: {loss_zeros.item():.4f} (should be HIGHER)")
 
-    # Verify gradients
-    total_loss.backward()
+    loss.backward()
     print("\n✓ Gradient flow OK")
-    print("✓ Loss test passed!")

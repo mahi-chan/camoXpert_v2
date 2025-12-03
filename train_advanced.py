@@ -412,15 +412,14 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         betas=(0.9, 0.999)
     )
 
-    # Use CombinedEnhancedLoss for TDD/GAD/BPN integration
-    # This loss function handles all boundary-aware components
+    # Production loss configuration - SOTA-focused
     enhanced_loss_fn = CombinedEnhancedLoss(
         seg_weight=1.0,
-        boundary_weight=2.0,
-        discontinuity_weight=0.1,  # Reduced from 0.3 to 0.1
-        expert_weight=0.3,
-        hard_mining_weight=0.5,
-        load_balance_weight=0.1
+        boundary_weight=0.3,
+        expert_weight=0.5,
+        anti_collapse_weight=2.0,
+        load_balance_weight=0.05,
+        discontinuity_weight=0.0,  # DISABLED - TDD/GAD provide features only
     )
 
     # Wrapper to make CombinedEnhancedLoss compatible with trainer interface
@@ -447,10 +446,10 @@ def create_optimizer_and_criterion(model, args, is_main_process):
 
     if is_main_process:
         print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
-        print(f"✓ Loss: CombinedEnhancedLoss (boundary-aware + TDD/GAD/BPN)")
-        print(f"    Segmentation: 1.0, Boundary: 2.0 ⭐")
-        print(f"    Discontinuity (TDD+GAD): 0.1, Per-Expert: 0.3")
-        print(f"    Hard Mining: 0.5, Load Balance: 0.1")
+        print(f"✓ Loss: Production SOTA Configuration")
+        print(f"    Main: BCE + Dice + IoU + Focal")
+        print(f"    Boundary: 0.3, Expert: 0.5, Anti-Collapse: 2.0 ⭐")
+        print(f"    Load Balance: 0.05, TDD/GAD: DISABLED (features only)")
 
     return optimizer, criterion
 
@@ -939,35 +938,45 @@ def main():
 
         # Print results (main process only)
         if is_main_process:
-            print(f"\nEpoch [{epoch}/{args.epochs}] Results:")
-            print(f"  Train Loss: {train_metrics['loss']:.4f}")
+            # Get detailed loss breakdown from criterion
+            loss_info = trainer.criterion.get_last_loss_dict() if hasattr(trainer.criterion, 'get_last_loss_dict') else {}
+
+            print(f"\nEpoch [{epoch+1}/{args.epochs}] Results:")
+            print(f"  Total Loss: {train_metrics['loss']:.4f}")
+
+            # Loss breakdown
+            if loss_info:
+                print(f"  Loss Breakdown:")
+                if 'bce' in loss_info:
+                    print(f"    BCE: {loss_info['bce']:.4f}, Dice: {loss_info.get('dice', 0):.4f}, IoU: {loss_info.get('iou', 0):.4f}, Focal: {loss_info.get('focal', 0):.4f}")
+                if 'anti_collapse' in loss_info:
+                    print(f"    Anti-Collapse: {loss_info['anti_collapse']:.4f} {'⚠' if loss_info['anti_collapse'] > 1.0 else '✓'}")
+                if 'boundary' in loss_info:
+                    print(f"    Boundary: {loss_info['boundary']:.4f}")
+                if 'expert' in loss_info:
+                    print(f"    Expert: {loss_info['expert']:.4f}")
+                if 'tdd_mean' in loss_info or 'gad_mean' in loss_info:
+                    print(f"    TDD/GAD (monitoring): {loss_info.get('tdd_mean', 0):.3f} / {loss_info.get('gad_mean', 0):.3f}")
+
+            # Validation metrics
             if val_metrics is not None:
-                print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-                print(f"  Val S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
-                print(f"  Val F-measure: {val_metrics['val_f_measure']:.4f}")
-                print(f"  Val MAE: {val_metrics['val_mae']:.4f}")
-                print(f"  Val IoU: {val_metrics['val_iou']:.4f}")
+                print(f"  Validation:")
+                print(f"    S-measure: {val_metrics['val_s_measure']:.4f} ⭐")
+                print(f"    IoU: {val_metrics['val_iou']:.4f}")
+                print(f"    F-measure: {val_metrics['val_f_measure']:.4f}")
+                print(f"    MAE: {val_metrics['val_mae']:.4f}")
             else:
                 print(f"  Validation skipped (running every {args.val_freq} epochs)")
-            print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
-            # TDD/GAD/BPN component losses (integrated in model)
-            if 'boundary_loss' in train_metrics:
-                print(f"  Boundary Loss (BPN): {train_metrics['boundary_loss']:.4f}")
-            if 'gradient_loss' in train_metrics:
-                print(f"  TDD Loss: {train_metrics['gradient_loss']:.4f}")
-            if 'sdt_loss' in train_metrics:
-                print(f"  GAD Loss: {train_metrics['sdt_loss']:.4f}")
+            print(f"  Learning Rate: {train_metrics['lr']:.6f}")
 
             if args.enable_progressive_aug and trainer.augmentation is not None:
                 print(f"  Aug Strength: {trainer.augmentation.current_strength:.3f}")
 
-            # MoE statistics
-            if 'load_balance_loss' in train_metrics:
-                print(f"  Load Balance Loss: {train_metrics['load_balance_loss']:.6f}")
-
+            # Only report expert collapse after router warmup (expected during warmup)
             if 'collapse_collapsed' in train_metrics and train_metrics['collapse_collapsed']:
-                print(f"  ⚠ Expert collapse detected!")
+                if epoch >= args.router_warmup_epochs:
+                    print(f"  ⚠ Expert collapse detected after warmup!")
 
             print()
 
