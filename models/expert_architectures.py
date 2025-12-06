@@ -144,6 +144,9 @@ class DeepSupervisionDecoder(nn.Module):
             nn.Conv2d(16, 1, 1)
         )
 
+        # Dropout for regularization
+        self.dropout = nn.Dropout2d(0.1)
+
     def forward(self, features, return_aux=False):
         f1, f2, f3, f4 = features
 
@@ -157,6 +160,10 @@ class DeepSupervisionDecoder(nn.Module):
         # f1 is H/4, so final output should be H (4x upsampling total)
         output_size = (f1.shape[2] * 4, f1.shape[3] * 4)
         d1 = F.interpolate(d1, size=output_size, mode='bilinear', align_corners=False)
+
+        # Apply dropout during training
+        if self.training:
+            d1 = self.dropout(d1)
 
         # Main prediction
         pred = self.pred_head(d1)
@@ -426,6 +433,9 @@ class SINetExpert(nn.Module):
             nn.Conv2d(32, 1, 1)
         )
 
+        # Dropout for regularization
+        self.dropout = nn.Dropout2d(0.1)
+
     def forward(self, features, return_aux=True):
         """
         Args:
@@ -469,6 +479,9 @@ class SINetExpert(nn.Module):
         # Step 5: Generate predictions
         # Compute output size (4x f1 size)
         output_size = (f1.shape[2] * 4, f1.shape[3] * 4)
+
+        # Apply dropout for regularization
+        d1 = self.dropout(d1)
 
         # Main prediction from finest level
         pred = self.pred_head1(d1)
@@ -801,6 +814,9 @@ class PraNetExpert(nn.Module):
             nn.Conv2d(dim, 1, 1) for dim in feature_dims
         ])
 
+        # Dropout for regularization
+        self.dropout = nn.Dropout2d(0.1)
+
     def forward(self, features, return_aux=True):
         """
         Args:
@@ -846,6 +862,10 @@ class PraNetExpert(nn.Module):
 
         # Upsample aggregated features
         aggregated = F.interpolate(aggregated, size=output_size, mode='bilinear', align_corners=False)
+
+        # Apply dropout during training
+        if self.training:
+            aggregated = self.dropout(aggregated)
 
         # Main prediction
         pred = self.main_pred(aggregated)
@@ -1197,6 +1217,9 @@ class ZoomNetExpert(nn.Module):
         # Decoder with deep supervision
         self.decoder = DeepSupervisionDecoder(feature_dims)
 
+        # Dropout for regularization
+        self.dropout = nn.Dropout2d(0.1)
+
     def forward(self, features, return_aux=True):
         """
         Args:
@@ -1247,6 +1270,10 @@ class ZoomNetExpert(nn.Module):
         for feat, refine in zip(attended_features, self.refinement):
             refined = refine(feat)
             refined_features.append(refined + feat)  # Residual
+
+        # Apply dropout to refined features during training
+        if self.training:
+            refined_features = [self.dropout(f) for f in refined_features]
 
         # Step 6: Decode with deep supervision
         pred, aux_outputs = self.decoder(refined_features, return_aux=True)
