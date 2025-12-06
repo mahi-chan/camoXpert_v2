@@ -154,21 +154,28 @@ class COD10KDataset(Dataset):
 
         if self.augment:
             # NO RESIZE in transform - already done in cache!
-            # STRONG augmentation to beat SOTA (optimized for speed)
+            # STRONGER augmentation from start to prevent overfitting
             self.transform = A.Compose([
+                # Geometric - STRONGER
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.3),
-                A.RandomRotate90(p=0.3),
-                A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.5),
+                A.RandomRotate90(p=0.5),  # Increased from 0.3
+                A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.25, rotate_limit=20, p=0.6),  # Stronger
+
+                # Noise/Blur - Keep similar
                 A.OneOf([
-                    A.GaussNoise(p=1.0),  # Fixed: removed invalid var_limit
+                    A.GaussNoise(p=1.0),
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=7, p=1.0),
-                ], p=0.3),
-                # Removed slow distortions (ElasticTransform takes 5-10s per image!)
-                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
-                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.3),
+                ], p=0.4),  # Increased from 0.3
+
+                # Color - STRONGER
+                A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.6),  # Stronger
+                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),  # Stronger
+
+                # Cutout - ADD THIS (very effective for overfitting)
+                A.CoarseDropout(max_holes=8, max_height=32, max_width=32, min_holes=2, min_height=16, min_width=16, p=0.3),
+
                 A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 ToTensorV2()
             ])
