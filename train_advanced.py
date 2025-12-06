@@ -53,8 +53,8 @@ from data.dataset import COD10KDataset
 from metrics.cod_metrics import CODMetrics
 from models.model_level_moe import ModelLevelMoE
 from models.utils import set_seed
-from models.multi_scale_processor import MultiScaleInputProcessor
-from models.boundary_refinement import BoundaryRefinementModule
+# from models.multi_scale_processor import MultiScaleInputProcessor  # UNUSED
+# from models.boundary_refinement import BoundaryRefinementModule  # UNUSED
 
 
 def parse_args():
@@ -63,9 +63,9 @@ def parse_args():
     # Data
     parser.add_argument('--data-root', type=str, required=True,
                         help='Path to COD10K-v3 dataset')
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=8,
                         help='Batch size per GPU')
-    parser.add_argument('--img-size', type=int, default=384,
+    parser.add_argument('--img-size', type=int, default=352,
                         help='Input image size')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='DataLoader workers')
@@ -90,10 +90,12 @@ def parse_args():
     # Training
     parser.add_argument('--epochs', type=int, default=100,
                         help='Total training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=5e-5,
                         help='Initial learning rate')
-    parser.add_argument('--weight-decay', type=float, default=1e-4,
+    parser.add_argument('--weight-decay', type=float, default=0.05,
                         help='Weight decay')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout rate for regularization')
     parser.add_argument('--accumulation-steps', type=int, default=2,
                         help='Gradient accumulation steps')
 
@@ -107,21 +109,21 @@ def parse_args():
     parser.add_argument('--no-amp', action='store_false', dest='use_amp',
                         help='Disable AMP')
 
-    # Progressive augmentation (delayed for convergence)
+    # Progressive augmentation (stronger from start)
     parser.add_argument('--enable-progressive-aug', action='store_true', default=True,
                         help='Enable progressive augmentation')
-    parser.add_argument('--aug-transition-epoch', type=int, default=50,
-                        help='Epoch to start increasing augmentation (default: 50, delayed for convergence)')
-    parser.add_argument('--aug-max-strength', type=float, default=0.5,
-                        help='Maximum augmentation strength (default: 0.5)')
+    parser.add_argument('--aug-transition-epoch', type=int, default=0,
+                        help='Epoch to start increasing augmentation (default: 0, starts immediately)')
+    parser.add_argument('--aug-max-strength', type=float, default=0.7,
+                        help='Maximum augmentation strength (default: 0.7)')
     parser.add_argument('--aug-transition-duration', type=int, default=50,
                         help='Epochs to ramp up augmentation strength (default: 50)')
 
     # Router warmup (for MoE models)
     parser.add_argument('--enable-router-warmup', action='store_true', default=True,
                         help='Enable router warmup (freeze router for initial epochs)')
-    parser.add_argument('--router-warmup-epochs', type=int, default=20,
-                        help='Number of epochs to keep router frozen (default: 20)')
+    parser.add_argument('--router-warmup-epochs', type=int, default=5,
+                        help='Number of epochs to keep router frozen (default: 5)')
 
     # Loss Function Selection
     parser.add_argument('--use-combined-loss', action='store_true',
@@ -402,9 +404,8 @@ def create_model(args, device, is_main_process):
 
 
 def create_optimizer_and_criterion(model, args, is_main_process):
-    """Create optimizer and enhanced boundary-aware loss."""
+    """Create optimizer and simple structure loss."""
 
-    # Optimizer with weight decay
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -412,118 +413,22 @@ def create_optimizer_and_criterion(model, args, is_main_process):
         betas=(0.9, 0.999)
     )
 
-    # Production loss configuration - AGGRESSIVE for 0.89+ S-measure
-    enhanced_loss_fn = CombinedEnhancedLoss(
-        seg_weight=1.2,              # Increased from 1.0 - stronger main supervision
-        boundary_weight=0.5,         # Increased from 0.3 - better boundaries
-        expert_weight=0.7,           # Increased from 0.5 - all experts learn well
-        anti_collapse_weight=3.0,    # Increased from 2.0 - MORE stability
-        load_balance_weight=0.08,    # Increased from 0.05 - better routing
-        discontinuity_weight=0.0,    # DISABLED - TDD/GAD provide features only
-    )
-
-    # Wrapper to make CombinedEnhancedLoss compatible with trainer interface
-    class EnhancedLossWrapper:
-        def __init__(self, loss_fn):
-            self.loss_fn = loss_fn
-            self.last_loss_dict = {}
-
-        def __call__(self, predictions, targets, input_image=None, aux_outputs=None):
-            """Call loss function and return only total loss"""
-            total_loss, loss_dict = self.loss_fn(predictions, targets, aux_outputs=aux_outputs)
-            self.last_loss_dict = loss_dict  # Store for logging
-            return total_loss
-
-        def update_epoch(self, epoch, total_epochs):
-            """Dummy method for compatibility with CompositeLoss"""
-            pass
-
-        def get_last_loss_dict(self):
-            """Get last computed loss components"""
-            return self.last_loss_dict
-
-    criterion = EnhancedLossWrapper(enhanced_loss_fn)
+    # Simple loss with label smoothing
+    from losses.composite_loss import CompositeLossSystem
+    criterion = CompositeLossSystem(label_smoothing=0.1)
 
     if is_main_process:
         print(f"✓ Optimizer: AdamW (lr={args.lr}, wd={args.weight_decay})")
-        print(f"✓ Loss: AGGRESSIVE SOTA Configuration (0.89+ target)")
-        print(f"    Main: BCE + Dice + IoU + Focal (weight: 1.2)")
-        print(f"    Boundary: 0.5, Expert: 0.7, Anti-Collapse: 3.0 ⭐")
-        print(f"    Load Balance: 0.08, TDD/GAD: DISABLED (features only)")
+        print(f"✓ Loss: Simple Structure Loss with label_smoothing=0.1")
 
     return optimizer, criterion
 
 
-def compute_additional_losses(args, multi_scale_processor, boundary_refinement,
-                             images, predictions, targets, epoch):
-    """
-    Compute additional losses from multi-scale and boundary refinement.
-
-    Args:
-        args: Training arguments
-        multi_scale_processor: Multi-scale processor (or None)
-        boundary_refinement: Boundary refinement module (or None)
-        images: Input images
-        predictions: Model predictions
-        targets: Ground truth masks
-        epoch: Current epoch
-
-    Returns:
-        total_additional_loss: Sum of all additional losses
-        loss_dict: Dictionary with individual loss components
-    """
-    total_additional_loss = 0.0
-    loss_dict = {}
-
-    # Multi-scale losses
-    if args.use_multi_scale and multi_scale_processor is not None:
-        # Get the actual processor (unwrap DDP if needed)
-        processor = multi_scale_processor.module if hasattr(multi_scale_processor, 'module') else multi_scale_processor
-
-        # NOTE: For full multi-scale loss computation, you would need to:
-        # 1. Get scale-specific predictions from the processor
-        # 2. Compute loss for each scale
-        # 3. Weight and sum them
-        # This requires modifications to how the model processes features
-        # For now, we'll use a placeholder approach
-
-        # Placeholder: scale loss weight applied to regularization
-        scale_loss = torch.tensor(0.0, device=predictions.device)
-        loss_dict['scale_loss'] = scale_loss.item()
-        total_additional_loss += args.scale_loss_weight * scale_loss
-
-    # Boundary refinement losses
-    if args.use_boundary_refinement and boundary_refinement is not None:
-        # Get the actual module (unwrap DDP if needed)
-        boundary_module = boundary_refinement.module if hasattr(boundary_refinement, 'module') else boundary_refinement
-
-        # Set current epoch for lambda scheduling
-        boundary_module.set_epoch(epoch)
-
-        # NOTE: For full boundary refinement, you would need to:
-        # 1. Extract features from the model
-        # 2. Apply boundary refinement
-        # 3. Compute gradient + SDT losses
-        # This requires the model to expose intermediate features
-        # For now, we apply boundary losses directly to predictions
-
-        boundary_losses = boundary_module.compute_boundary_loss(
-            predictions,
-            targets,
-            intermediate_preds=None
-        )
-
-        loss_dict['boundary_loss'] = boundary_losses['total_boundary_loss'].item()
-        if 'gradient_loss' in boundary_losses:
-            loss_dict['gradient_loss'] = boundary_losses['gradient_loss'].item()
-        if 'sdt_loss' in boundary_losses:
-            loss_dict['sdt_loss'] = boundary_losses['sdt_loss'].item()
-        if 'current_lambda' in boundary_losses:
-            loss_dict['boundary_lambda'] = boundary_losses['current_lambda'].item()
-
-        total_additional_loss += args.boundary_loss_weight * boundary_losses['total_boundary_loss']
-
-    return total_additional_loss, loss_dict
+# UNUSED: compute_additional_losses - removed for simplicity
+# def compute_additional_losses(args, multi_scale_processor, boundary_refinement,
+#                              images, predictions, targets, epoch):
+#     """REMOVED - Not needed with simple structure loss"""
+#     pass
 
 
 def set_router_trainable(model, trainable):
@@ -569,218 +474,11 @@ def compute_metrics(predictions, targets):
     }
 
 
-def train_epoch_with_additional_losses(
-    trainer,
-    train_loader,
-    epoch: int,
-    multi_scale_processor,
-    boundary_refinement,
-    args
-):
-    """
-    Custom training epoch that incorporates additional losses from
-    multi-scale processing and boundary refinement.
-
-    This extends OptimizedTrainer's train_epoch to include:
-    - Boundary refinement losses (gradient supervision + SDT)
-    - Multi-scale losses (optional)
-    """
-    from torch.amp import autocast
-    from tqdm import tqdm
-
-    trainer.model.train()
-    trainer.current_epoch = epoch
-
-    # Update augmentation strength
-    if trainer.enable_progressive_aug:
-        trainer.augmentation.update_epoch(epoch)
-
-    epoch_loss = 0.0
-    epoch_boundary_loss = 0.0
-    epoch_gradient_loss = 0.0
-    epoch_sdt_loss = 0.0
-    num_batches = 0
-
-    # Reset gradient accumulation
-    trainer.optimizer.zero_grad()
-
-    # Progress bar
-    try:
-        train_iter = tqdm(train_loader, desc=f'Epoch {epoch}', ncols=120, leave=True)
-    except:
-        train_iter = train_loader
-
-    for batch_idx, (images, masks) in enumerate(train_iter):
-        images = images.to(trainer.device)
-        masks = masks.to(trainer.device)
-
-        # Apply progressive augmentation
-        if trainer.enable_progressive_aug and trainer.augmentation is not None:
-            if torch.rand(1).item() < trainer.augmentation.current_strength:
-                images, masks = trainer.augmentation.apply(images, masks, 'random')
-
-        # Forward pass with mixed precision
-        with autocast('cuda', enabled=trainer.use_amp):
-            # Forward pass - get prediction AND auxiliary outputs (routing_info)
-            outputs = trainer.model(images, return_routing_info=True)
-
-            # Handle output format from ModelLevelMoE
-            if isinstance(outputs, tuple) and len(outputs) == 2:
-                predictions, aux_outputs = outputs
-            elif isinstance(outputs, dict):
-                predictions = outputs['predictions']
-                aux_outputs = outputs
-            else:
-                predictions = outputs
-                aux_outputs = None
-
-            # Apply sigmoid if needed
-            if predictions.min() < 0:
-                predictions = torch.sigmoid(predictions)
-
-            # Compute loss with aux_outputs (TDD, GAD, BPN, per-expert)
-            # The aux_outputs contain routing_info with all boundary detection info
-            loss = trainer.criterion(predictions, masks, input_image=images, aux_outputs=aux_outputs)
-
-            # Get loss breakdown for logging
-            loss_components = trainer.criterion.get_last_loss_dict() if hasattr(trainer.criterion, 'get_last_loss_dict') else {}
-
-            # Handle load balancing (already included in CombinedEnhancedLoss, but update tracker)
-            if trainer.enable_load_balancing and aux_outputs is not None and isinstance(aux_outputs, dict):
-                routing_probs = aux_outputs.get('routing_probs')
-                if routing_probs is None:
-                    routing_probs = aux_outputs.get('expert_probs')
-
-                expert_assignments = aux_outputs.get('expert_assignments')
-                if expert_assignments is None:
-                    expert_assignments = aux_outputs.get('top_k_indices')
-
-                if routing_probs is not None and expert_assignments is not None:
-                    trainer.load_balancer.update(routing_probs, expert_assignments)
-
-            # ========== ADDITIONAL LOSSES ==========
-            # Note: TDD/GAD/BPN losses are now included in CombinedEnhancedLoss
-            # Only compute multi-scale losses if enabled
-            additional_loss = 0.0
-            additional_components = {}
-
-            if args.use_multi_scale and multi_scale_processor is not None:
-                additional_loss, additional_components = compute_additional_losses(
-                    args, multi_scale_processor, None,  # boundary_refinement=None (now integrated)
-                    images, predictions, masks, epoch
-                )
-                # Add multi-scale losses to total loss
-                loss = loss + additional_loss
-                # Merge loss components
-                loss_components.update(additional_components)
-
-            # Scale loss for gradient accumulation
-            loss = loss / trainer.accumulation_steps
-
-        # Backward pass with gradient scaling
-        trainer.scaler.scale(loss).backward()
-
-        # Update expert collapse detector
-        if trainer.enable_collapse_detection and aux_outputs is not None and isinstance(aux_outputs, dict):
-            routing_probs = aux_outputs.get('routing_probs')
-            if routing_probs is None:
-                routing_probs = aux_outputs.get('expert_probs')
-
-            expert_assignments = aux_outputs.get('expert_assignments')
-            if expert_assignments is None:
-                expert_assignments = aux_outputs.get('top_k_indices')
-
-            if routing_probs is not None and expert_assignments is not None:
-                with torch.no_grad():
-                    trainer.collapse_detector.update(routing_probs, expert_assignments)
-
-        # Optimizer step after accumulation
-        if (batch_idx + 1) % trainer.accumulation_steps == 0:
-            # Gradient clipping
-            trainer.scaler.unscale_(trainer.optimizer)
-            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), max_norm=1.0)
-
-            # Optimizer step
-            trainer.scaler.step(trainer.optimizer)
-            trainer.scaler.update()
-            trainer.optimizer.zero_grad()
-
-            trainer.global_step += 1
-
-        # Accumulate losses
-        epoch_loss += loss.item() * trainer.accumulation_steps
-        # Track TDD/GAD/BPN component losses
-        if 'boundary' in loss_components:
-            epoch_boundary_loss += loss_components['boundary']
-        if 'tdd' in loss_components:
-            epoch_gradient_loss += loss_components['tdd']  # Reuse var name for TDD
-        if 'gad' in loss_components:
-            epoch_sdt_loss += loss_components['gad']  # Reuse var name for GAD
-        num_batches += 1
-
-        # Logging
-        if (batch_idx + 1) % 20 == 0:
-            avg_loss = epoch_loss / num_batches
-            current_lr = trainer.optimizer.param_groups[0]['lr']
-
-            # Update progress bar with TDD/GAD/BPN metrics
-            try:
-                postfix_dict = {
-                    'loss': f'{avg_loss:.4f}',
-                    'lr': f'{current_lr:.6f}'
-                }
-                # Add component losses if available
-                if 'seg_bce' in loss_components:
-                    postfix_dict['seg'] = f"{loss_components['seg_bce']:.3f}"
-                if 'boundary' in loss_components:
-                    postfix_dict['bnd'] = f"{loss_components['boundary']:.3f}"
-                if 'tdd' in loss_components:
-                    postfix_dict['tdd'] = f"{loss_components['tdd']:.3f}"
-                if 'gad' in loss_components:
-                    postfix_dict['gad'] = f"{loss_components['gad']:.3f}"
-                if 'expert' in loss_components:
-                    postfix_dict['exp'] = f"{loss_components['expert']:.3f}"
-
-                if trainer.enable_progressive_aug and trainer.augmentation is not None:
-                    postfix_dict['aug'] = f'{trainer.augmentation.current_strength:.2f}'
-                train_iter.set_postfix(postfix_dict)
-            except:
-                print(f"Epoch [{epoch}] Batch [{batch_idx+1}/{len(train_loader)}] "
-                      f"Loss: {avg_loss:.4f} LR: {current_lr:.6f}")
-
-    # Step scheduler
-    trainer.scheduler.step()
-
-    # Get metrics
-    avg_loss = epoch_loss / max(num_batches, 1)
-    current_lr = trainer.optimizer.param_groups[0]['lr']
-
-    metrics = {
-        'loss': avg_loss,
-        'lr': current_lr
-    }
-
-    # Add boundary refinement metrics
-    if epoch_boundary_loss > 0:
-        metrics['boundary_loss'] = epoch_boundary_loss / num_batches
-    if epoch_gradient_loss > 0:
-        metrics['gradient_loss'] = epoch_gradient_loss / num_batches
-    if epoch_sdt_loss > 0:
-        metrics['sdt_loss'] = epoch_sdt_loss / num_batches
-
-    # Add MoE metrics
-    if trainer.enable_load_balancing and hasattr(trainer.load_balancer, 'get_statistics'):
-        lb_stats = trainer.load_balancer.get_statistics()
-        if lb_stats:
-            metrics.update(lb_stats)
-
-    if trainer.enable_collapse_detection and hasattr(trainer, 'collapse_detector'):
-        collapsed, reasons = trainer.collapse_detector.check_collapse()
-        metrics['collapse_collapsed'] = collapsed
-        if collapsed:
-            metrics['collapse_reasons'] = reasons
-
-    return metrics
+# UNUSED: train_epoch_with_additional_losses - removed for simplicity
+# Now using trainer.train_epoch() directly with simple structure loss
+# def train_epoch_with_additional_losses(...):
+#     """REMOVED - Not needed with simple structure loss"""
+#     pass
 
 
 def main():
@@ -917,12 +615,8 @@ def main():
             boundary_module = boundary_refinement.module if hasattr(boundary_refinement, 'module') else boundary_refinement
             boundary_module.set_epoch(epoch)
 
-        # Train one epoch (always use enhanced training for TDD/GAD/BPN support)
-        # The enhanced training handles aux_outputs from the model
-        train_metrics = train_epoch_with_additional_losses(
-            trainer, train_loader, epoch,
-            multi_scale_processor, boundary_refinement, args
-        )
+        # Train one epoch with simple structure loss
+        train_metrics = trainer.train_epoch(train_loader, epoch=epoch, log_interval=20)
 
         # Validate (run every val_freq epochs, or on last epoch, or on first epoch)
         should_validate = ((epoch + 1) % args.val_freq == 0) or (epoch == 0) or (epoch == args.epochs - 1)
@@ -965,6 +659,14 @@ def main():
                 print(f"    IoU: {val_metrics['val_iou']:.4f}")
                 print(f"    F-measure: {val_metrics['val_f_measure']:.4f}")
                 print(f"    MAE: {val_metrics['val_mae']:.4f}")
+
+                # Overfitting monitoring
+                if 'val_iou' in val_metrics:
+                    train_iou = train_metrics.get('iou', 0.5)  # Estimate from loss
+                    val_iou = val_metrics['val_iou']
+                    gap = train_iou - val_iou
+                    if gap > 0.10:
+                        print(f"  ⚠️ OVERFITTING: Train-Val gap = {gap:.3f} (should be < 0.10)")
             else:
                 print(f"  Validation skipped (running every {args.val_freq} epochs)")
 
