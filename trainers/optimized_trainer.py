@@ -773,6 +773,9 @@ class OptimizedTrainer:
         epoch_lb_loss = 0.0
         num_batches = 0
 
+        # Track expert selections for monitoring router collapse
+        expert_selection_counts = {}
+
         # Reset gradient accumulation
         self.optimizer.zero_grad()
 
@@ -835,6 +838,11 @@ class OptimizedTrainer:
 
                         # Update load balancer statistics
                         self.load_balancer.update(routing_probs, expert_assignments)
+
+                        # Track expert selections for monitoring
+                        with torch.no_grad():
+                            for expert_idx in expert_assignments.flatten().cpu().numpy():
+                                expert_selection_counts[expert_idx] = expert_selection_counts.get(expert_idx, 0) + 1
 
                 # Scale loss for gradient accumulation
                 loss = loss / self.accumulation_steps
@@ -928,6 +936,15 @@ class OptimizedTrainer:
         if self.enable_load_balancing:
             global_stats = self.load_balancer.get_global_statistics()
             metrics.update({f'global_{k}': v for k, v in global_stats.items()})
+
+        # Add expert selection statistics
+        if expert_selection_counts:
+            total_selections = sum(expert_selection_counts.values())
+            metrics['expert_selections'] = expert_selection_counts
+            metrics['expert_selection_pcts'] = {
+                f'expert_{k}': (v / total_selections * 100)
+                for k, v in expert_selection_counts.items()
+            }
 
         return metrics
 

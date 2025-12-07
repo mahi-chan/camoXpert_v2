@@ -678,6 +678,19 @@ def main():
             if args.enable_progressive_aug and trainer.augmentation is not None:
                 print(f"  Aug Strength: {trainer.augmentation.current_strength:.3f}")
 
+            # Expert selection monitoring (router collapse detection)
+            if 'expert_selection_pcts' in train_metrics:
+                pcts = train_metrics['expert_selection_pcts']
+                print(f"  Router Selections: ", end="")
+                for i in range(args.num_experts):
+                    key = f'expert_{i}'
+                    if key in pcts:
+                        pct = pcts[key]
+                        # Warn if any expert is selected < 15% or > 55% (collapse indicator)
+                        warning = " ⚠️" if pct < 15 or pct > 55 else ""
+                        print(f"E{i}={pct:.1f}%{warning} ", end="")
+                print()  # newline
+
             # Only report expert collapse after router warmup (expected during warmup)
             if 'collapse_collapsed' in train_metrics and train_metrics['collapse_collapsed']:
                 if epoch >= args.router_warmup_epochs:
