@@ -26,7 +26,7 @@ def test_all():
     # Test 2: Model with expert tracking
     print("\n[2] Testing Model...")
     from models.model_level_moe import ModelLevelMoE
-    model = ModelLevelMoE(backbone='pvt_v2_b2', num_experts=3, top_k=2, pretrained=False)
+    model = ModelLevelMoE(backbone_name='pvt_v2_b2', num_experts=3, top_k=2, pretrained=False)
     model.eval()
 
     x = torch.randn(2, 3, 352, 352)
