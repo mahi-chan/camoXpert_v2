@@ -177,6 +177,8 @@ def parse_args():
                         help='Run validation every N epochs (default: 1 = every epoch)')
     parser.add_argument('--resume-from', type=str, default=None,
                         help='Resume from checkpoint')
+    parser.add_argument('--load-weights-only', action='store_true', default=False,
+                        help='Only load model weights from checkpoint, not optimizer state (allows changing lr/wd)')
 
     # Distributed
     parser.add_argument('--use-ddp', action='store_true', default=False,
@@ -569,8 +571,9 @@ def main():
 
     if args.resume_from and os.path.exists(args.resume_from):
         if is_main_process:
-            print(f"Resuming from: {args.resume_from}")
-        start_epoch = trainer.load_checkpoint(args.resume_from)
+            mode = "weights only" if args.load_weights_only else "full checkpoint"
+            print(f"Resuming from: {args.resume_from} ({mode})")
+        start_epoch = trainer.load_checkpoint(args.resume_from, weights_only=args.load_weights_only)
         start_epoch += 1
 
         # Restore best_smeasure from best_model.pth if it exists

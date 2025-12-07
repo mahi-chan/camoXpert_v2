@@ -1032,31 +1032,44 @@ class OptimizedTrainer:
         torch.save(checkpoint, filepath)
         print(f"Checkpoint saved to {filepath}")
 
-    def load_checkpoint(self, filepath: str) -> int:
+    def load_checkpoint(self, filepath: str, weights_only: bool = False) -> int:
         """
         Load training checkpoint.
+
+        Args:
+            filepath: Path to checkpoint file
+            weights_only: If True, only load model weights (allows changing lr/wd)
 
         Returns:
             epoch: Epoch number to resume from
         """
         checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
+        # Always load model weights
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        self.lr_history = checkpoint.get('lr_history', [])
-        self.epoch_losses = checkpoint.get('epoch_losses', [])
+        if weights_only:
+            # Only load model weights, keep fresh optimizer/scheduler
+            print(f"✓ Loaded model weights only from {filepath} (epoch {checkpoint['epoch']})")
+            print(f"  Optimizer/scheduler: Using NEW hyperparameters")
+            epoch = 0  # Restart epoch counter for new training phase
+        else:
+            # Load full checkpoint (optimizer, scheduler, scaler)
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
-        # Restore MoE statistics
-        if self.enable_load_balancing and 'load_balancer_state' in checkpoint:
-            lb_state = checkpoint['load_balancer_state']
-            self.load_balancer.global_expert_counts = lb_state['global_expert_counts']
-            self.load_balancer.global_token_count = lb_state['global_token_count']
+            self.lr_history = checkpoint.get('lr_history', [])
+            self.epoch_losses = checkpoint.get('epoch_losses', [])
 
-        epoch = checkpoint['epoch']
-        print(f"Checkpoint loaded from {filepath} (epoch {epoch})")
+            # Restore MoE statistics
+            if self.enable_load_balancing and 'load_balancer_state' in checkpoint:
+                lb_state = checkpoint['load_balancer_state']
+                self.load_balancer.global_expert_counts = lb_state['global_expert_counts']
+                self.load_balancer.global_token_count = lb_state['global_token_count']
+
+            epoch = checkpoint['epoch']
+            print(f"✓ Loaded full checkpoint from {filepath} (epoch {epoch})")
 
         return epoch
 
