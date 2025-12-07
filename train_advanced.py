@@ -369,7 +369,7 @@ def create_model(args, device, is_main_process):
         boundary_refinement = boundary_refinement.to(device)
     else:
         if is_main_process:
-            print(f"✓ Using integrated TDD/GAD/BPN modules (inside ModelLevelMoE)")
+            print(f"✓ TDD/GAD/BPN modules NOT used (removed for simplicity)")
 
     # Move base model to device
     model = model.to(device)

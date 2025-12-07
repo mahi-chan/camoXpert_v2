@@ -968,7 +968,7 @@ class ScaleIntegrationUnit(nn.Module):
         self.num_scales = len(feature_dims)
 
         # Lateral connections: project each scale to common dimension
-        common_dim = 128  # Reduced from 256 to match other experts' complexity
+        common_dim = 64  # Reduced from 256->128->64 to match other experts (~25M params)
         self.lateral_convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(dim, common_dim, 1),
