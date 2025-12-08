@@ -258,8 +258,10 @@ class GlobalBatchLoadBalancer:
         for i in range(self.num_experts):
             expert_count[i] = (expert_assignments == i).sum()
 
-        # Update global counts
-        self.global_expert_counts += expert_count.cpu()
+        # Update global counts (ensure both tensors are on CPU)
+        expert_count_cpu = expert_count.cpu()
+        self.global_expert_counts = self.global_expert_counts.cpu()  # Ensure it's on CPU
+        self.global_expert_counts += expert_count_cpu
         self.global_token_count += expert_assignments.numel()
 
         # Track batch usage
