@@ -970,13 +970,13 @@ class Visualizer:
         return outputs
 
 
-def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparallel=False):
+def load_checkpoint(checkpoint_path, num_experts=None, device='cuda', use_dataparallel=False):
     """
     Load model from checkpoint, handling DDP 'module.' prefix.
 
     Args:
         checkpoint_path: Path to checkpoint file
-        num_experts: Number of experts in the model
+        num_experts: Number of experts in the model (auto-detected if None)
         device: Device to load model on
         use_dataparallel: Whether to use DataParallel for multi-GPU inference
 
@@ -1007,6 +1007,21 @@ def load_checkpoint(checkpoint_path, num_experts=4, device='cuda', use_dataparal
             new_state_dict[k[7:]] = v  # Remove 'module.' prefix
         else:
             new_state_dict[k] = v
+
+    # Auto-detect num_experts from checkpoint if not specified
+    if num_experts is None:
+        # Look for router decision network output layer to detect num_experts
+        for key in new_state_dict.keys():
+            if 'router.decision_network' in key and 'weight' in key:
+                # The last layer outputs num_experts probabilities
+                if new_state_dict[key].dim() == 2:  # FC layer
+                    detected_experts = new_state_dict[key].shape[0]
+                    num_experts = detected_experts
+                    print(f"✓ Auto-detected {num_experts} experts from checkpoint")
+                    break
+
+        if num_experts is None:
+            raise ValueError("Could not auto-detect num_experts from checkpoint. Please specify --num-experts")
 
     # Create model
     model = ModelLevelMoE(
@@ -1385,8 +1400,8 @@ def main():
     # Model arguments
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
-    parser.add_argument('--num-experts', type=int, default=4,
-                       help='Number of experts in the model (default: 4)')
+    parser.add_argument('--num-experts', type=int, default=None,
+                       help='Number of experts in the model (auto-detected from checkpoint if not specified)')
 
     # Data arguments
     parser.add_argument('--data-root', type=str, default=None,
