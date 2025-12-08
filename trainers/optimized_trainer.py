@@ -806,9 +806,14 @@ class OptimizedTrainer:
                     aux_outputs = outputs.get('aux_outputs', None)
                     routing_info = outputs.get('routing_info', None)
                 elif isinstance(outputs, tuple):
+                    # Model returns (prediction, routing_info) where routing_info is a dict
                     predictions = outputs[0]
-                    aux_outputs = outputs[1] if len(outputs) > 1 else None
-                    routing_info = outputs[2] if len(outputs) > 2 else None
+                    if len(outputs) > 1 and isinstance(outputs[1], dict):
+                        routing_info = outputs[1]
+                        aux_outputs = routing_info.get('aux_outputs', None)
+                    else:
+                        routing_info = None
+                        aux_outputs = outputs[1] if len(outputs) > 1 else None
                 else:
                     predictions = outputs
                     aux_outputs = None
