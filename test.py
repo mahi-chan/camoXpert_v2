@@ -189,7 +189,7 @@ class CODMetrics:
         else:
             return 0.0
 
-    def f_measure(self, pred, gt, threshold=0.5, beta2=0.3):
+    def f_measure(self, pred, gt, threshold=0.5, beta2=0.09):
         """
         F-measure (weighted F-score).
 
@@ -197,7 +197,7 @@ class CODMetrics:
             pred: Prediction array [H, W] with values in [0, 1]
             gt: Ground truth array [H, W] with values in [0, 1]
             threshold: Binary threshold (default: 0.5)
-            beta2: Beta squared for F-beta score (default: 0.3)
+            beta2: Beta squared for F-beta score (default: 0.09, matching training)
 
         Returns:
             F-measure score (higher is better, range [0, 1])
