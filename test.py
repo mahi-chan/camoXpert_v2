@@ -215,8 +215,8 @@ class CODMetrics:
         precision = tp / (tp + fp + 1e-8)
         recall = tp / (tp + fn + 1e-8)
 
-        # F-measure
-        f_score = (1 + beta2) * precision * recall / (beta2 * precision + recall + 1e-8)
+        # F-measure (with proper parentheses to fix operator precedence)
+        f_score = ((1 + beta2) * precision * recall) / (beta2 * precision + recall + 1e-8)
 
         return f_score
 
