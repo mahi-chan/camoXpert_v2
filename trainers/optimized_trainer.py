@@ -797,8 +797,8 @@ class OptimizedTrainer:
 
             # Forward pass with mixed precision
             with autocast('cuda', enabled=self.use_amp):
-                # Forward pass
-                outputs = self.model(images)
+                # Forward pass - always request routing info during training for MoE
+                outputs = self.model(images, return_routing_info=True)
 
                 # Handle different output formats
                 if isinstance(outputs, dict):

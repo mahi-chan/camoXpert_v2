@@ -1159,59 +1159,78 @@ class ZoomNetExpert(nn.Module):
 
         self.feature_dims = feature_dims
 
-        # RFB modules for initial multi-scale processing
-        self.rfb_modules = nn.ModuleList([
-            RFB(dim, dim) for dim in feature_dims
+        # PARAMETER REDUCTION: Use reduced dimensions for lighter processing
+        # Keep paper architecture but make it efficient
+        reduced_dims = [max(32, dim // 2) for dim in feature_dims]  # [32, 64, 160, 256]
+
+        # Project to reduced dimensions first
+        self.input_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(dim, rdim, 1),
+                nn.BatchNorm2d(rdim),
+                nn.ReLU(inplace=True)
+            ) for dim, rdim in zip(feature_dims, reduced_dims)
         ])
 
-        # Multi-kernel zoom modules (3x3, 5x5, 7x7)
+        # RFB modules for initial multi-scale processing (on reduced dims)
+        self.rfb_modules = nn.ModuleList([
+            RFB(rdim, rdim) for rdim in reduced_dims
+        ])
+
+        # Multi-kernel zoom modules (3x3, 5x5, 7x7) - on reduced dims
         self.zoom_in_convs = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
+                nn.Conv2d(rdim, rdim, 3, padding=1),
+                nn.BatchNorm2d(rdim),
                 nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+            ) for rdim in reduced_dims
         ])
 
         self.zoom_balanced_convs = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim, 5, padding=2),
-                nn.BatchNorm2d(dim),
+                nn.Conv2d(rdim, rdim, 5, padding=2),
+                nn.BatchNorm2d(rdim),
                 nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+            ) for rdim in reduced_dims
         ])
 
         self.zoom_out_convs = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim, 7, padding=3),
-                nn.BatchNorm2d(dim),
+                nn.Conv2d(rdim, rdim, 7, padding=3),
+                nn.BatchNorm2d(rdim),
                 nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+            ) for rdim in reduced_dims
         ])
 
-        # Adaptive Zoom Fusion
+        # Adaptive Zoom Fusion (on reduced dims)
         self.zoom_fusion = nn.ModuleList([
-            AdaptiveZoomFusion(dim) for dim in feature_dims
+            AdaptiveZoomFusion(rdim) for rdim in reduced_dims
         ])
 
-        # Hierarchical Triplet Attention
+        # Hierarchical Triplet Attention (lighter with reduction=32)
         self.hta_modules = nn.ModuleList([
-            HierarchicalTripletAttention(dim, reduction=16) for dim in feature_dims
+            HierarchicalTripletAttention(rdim, reduction=32) for rdim in reduced_dims
         ])
 
-        # Scale Integration Unit (SIU)
-        self.siu = ScaleIntegrationUnit(feature_dims)
+        # Scale Integration Unit (SIU) - already reduced with common_dim=64
+        self.siu = ScaleIntegrationUnit(reduced_dims)
 
-        # Final refinement per scale
+        # Final refinement per scale (simplified to 1 conv layer)
         self.refinement = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(dim, dim, 3, padding=1),
-                nn.BatchNorm2d(dim),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(dim, dim, 3, padding=1),
+                nn.Conv2d(rdim, rdim, 3, padding=1),
+                nn.BatchNorm2d(rdim),
+                nn.ReLU(inplace=True)
+            ) for rdim in reduced_dims
+        ])
+
+        # Project back to original dimensions
+        self.output_proj = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(rdim, dim, 1),
                 nn.BatchNorm2d(dim),
                 nn.ReLU(inplace=True)
-            ) for dim in feature_dims
+            ) for rdim, dim in zip(reduced_dims, feature_dims)
         ])
 
         # Decoder with deep supervision
@@ -1231,8 +1250,11 @@ class ZoomNetExpert(nn.Module):
             pred: Main prediction [B, 1, H, W]
             aux_outputs: Auxiliary predictions
         """
+        # Step 0: Project to reduced dimensions for efficiency
+        projected_features = [proj(feat) for proj, feat in zip(self.input_proj, features)]
+
         # Step 1: Apply RFB for multi-scale receptive fields
-        rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, features)]
+        rfb_features = [rfb(feat) for rfb, feat in zip(self.rfb_modules, projected_features)]
 
         # Step 2: Multi-kernel zoom (3x3, 5x5, 7x7)
         zoomed_features = []
@@ -1275,8 +1297,11 @@ class ZoomNetExpert(nn.Module):
         if self.training:
             refined_features = [self.dropout(f) for f in refined_features]
 
-        # Step 6: Decode with deep supervision
-        pred, aux_outputs = self.decoder(refined_features, return_aux=True)
+        # Step 6: Project back to original dimensions
+        output_features = [proj(feat) for proj, feat in zip(self.output_proj, refined_features)]
+
+        # Step 7: Decode with deep supervision
+        pred, aux_outputs = self.decoder(output_features, return_aux=True)
 
         if return_aux:
             return pred, aux_outputs
